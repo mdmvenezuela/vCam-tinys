@@ -65,6 +65,11 @@
 @end
 
 static VCamOverlayWindow *sOverlayWindow = nil;
+// Keep a weak reference to the SpringBoard window that was active before VCam
+// temporarily presents its menu. The always-on pass-through overlay must not
+// become the key window, otherwise its full-screen controller can participate
+// in SpringBoard orientation decisions.
+static __weak UIWindow *sPreviousKeyWindow = nil;
 static BOOL sMenuVisible = NO;
 static BOOL sPendingMenuPresentation = NO;
 static NSUInteger sOverlayInstallAttempts = 0;
@@ -1066,10 +1071,23 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     VCamMenuViewController *controller = (VCamMenuViewController *)sOverlayWindow.rootViewController;
     (void)controller.view;
     sOverlayWindow.hidden = NO;
-    [sOverlayWindow makeKeyAndVisible];
-    sOverlayWindow.hidden = NO;
+
+    if (sPendingMenuPresentation) {
+        // Only take key-window status while the interactive VCam menu is open.
+        // Save SpringBoard's current key window so orientation and app-level
+        // event routing return to the original window when the menu closes.
+        UIWindowScene *scene = sOverlayWindow.windowScene;
+        for (UIWindow *candidate in scene.windows) {
+            if (candidate != sOverlayWindow && candidate.isKeyWindow) {
+                sPreviousKeyWindow = candidate;
+                break;
+            }
+        }
+        [sOverlayWindow makeKeyAndVisible];
+        sOverlayWindow.hidden = NO;
+    }
+
     [controller setMenuVisible:sPendingMenuPresentation];
-    if (!sPendingMenuPresentation) [sOverlayWindow resignKeyWindow];
     sPendingMenuPresentation = NO;
 }
 
@@ -1108,7 +1126,14 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         sPendingMenuPresentation = NO;
         if (!sOverlayWindow) return;
         [(VCamMenuViewController *)sOverlayWindow.rootViewController setMenuVisible:NO];
-        [sOverlayWindow resignKeyWindow];
+        if (sOverlayWindow.isKeyWindow) {
+            [sOverlayWindow resignKeyWindow];
+            UIWindow *previousWindow = sPreviousKeyWindow;
+            if (previousWindow && !previousWindow.hidden && previousWindow.windowScene == sOverlayWindow.windowScene) {
+                [previousWindow makeKeyWindow];
+            }
+        }
+        sPreviousKeyWindow = nil;
     });
 }
 @end
