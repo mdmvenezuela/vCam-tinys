@@ -68,7 +68,37 @@ static VCamOverlayWindow *sOverlayWindow = nil;
 static BOOL sMenuVisible = NO;
 static BOOL sPendingMenuPresentation = NO;
 static NSUInteger sOverlayInstallAttempts = 0;
-static const CGFloat VCamMoveStep = 0.05;
+static NSString * const VCamMoveStepKey = @"MoveStep";
+static NSString * const VCamZoomStepKey = @"ZoomStep";
+static const CGFloat VCamMoveSteps[] = {0.005, 0.01, 0.02, 0.05, 0.10};
+static const CGFloat VCamZoomSteps[] = {0.01, 0.02, 0.05, 0.10, 0.20, 0.50};
+static const NSUInteger VCamMoveStepCount = sizeof(VCamMoveSteps) / sizeof(VCamMoveSteps[0]);
+static const NSUInteger VCamZoomStepCount = sizeof(VCamZoomSteps) / sizeof(VCamZoomSteps[0]);
+
+static CGFloat VCamSelectedStep(NSString *key, const CGFloat *steps, NSUInteger count, CGFloat fallback) {
+    id stored = VCamCopySetting(key);
+    if (![stored respondsToSelector:@selector(doubleValue)]) return fallback;
+
+    CGFloat value = [stored doubleValue];
+    NSUInteger bestIndex = 0;
+    CGFloat bestDistance = CGFLOAT_MAX;
+    for (NSUInteger index = 0; index < count; index++) {
+        CGFloat distance = fabs(value - steps[index]);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            bestIndex = index;
+        }
+    }
+    return steps[bestIndex];
+}
+
+static CGFloat VCamCurrentMoveStep(void) {
+    return VCamSelectedStep(VCamMoveStepKey, VCamMoveSteps, VCamMoveStepCount, 0.05);
+}
+
+static CGFloat VCamCurrentZoomStep(void) {
+    return VCamSelectedStep(VCamZoomStepKey, VCamZoomSteps, VCamZoomStepCount, 0.10);
+}
 static NSString * const VCamMovieTypeIdentifier = @"public.movie";
 static NSString * const VCamImageTypeIdentifier = @"public.image";
 static NSString * const VCamOffsetCoordinateVersionKey = @"OffsetCoordinateVersion";
@@ -135,6 +165,12 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     UIButton *_controlVisibilityButton;
     UIButton *_videoButton;
     UIButton *_logsButton;
+    UIButton *_settingsButton;
+    UIStackView *_settingsContainer;
+    UILabel *_movementStepLabel;
+    UILabel *_zoomStepLabel;
+    UISlider *_movementStepSlider;
+    UISlider *_zoomStepSlider;
     UIButton *_backdrop;
     UIView *_panel;
     UIStackView *_logsContainer;
@@ -240,6 +276,51 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
     _controlVisibilityButton = VCamMakeButton(@"Hide Control", [UIColor colorWithWhite:1 alpha:0.12], self, @selector(toggleFloatingControlVisibility));
     [stack addArrangedSubview:_controlVisibilityButton];
+
+    _settingsButton = VCamMakeButton(@"Settings", [UIColor colorWithWhite:1 alpha:0.12], self, @selector(toggleSettings));
+    [stack addArrangedSubview:_settingsButton];
+
+    UIStackView *settingsStack = [[UIStackView alloc] init];
+    settingsStack.axis = UILayoutConstraintAxisVertical;
+    settingsStack.spacing = 8;
+    settingsStack.translatesAutoresizingMaskIntoConstraints = NO;
+    _settingsContainer = settingsStack;
+    _settingsContainer.hidden = YES;
+    _settingsContainer.layoutMargins = UIEdgeInsetsMake(10, 12, 10, 12);
+    _settingsContainer.preservesSuperviewLayoutMargins = NO;
+    _settingsContainer.backgroundColor = [UIColor colorWithWhite:0 alpha:0.20];
+    _settingsContainer.layer.cornerRadius = 12;
+    [_settingsContainer setLayoutMarginsRelativeArrangement:YES];
+    [stack addArrangedSubview:_settingsContainer];
+
+    UILabel *settingsTitle = VCamMakeLabel(@"Control sensitivity", [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold], UIColor.whiteColor);
+    [_settingsContainer addArrangedSubview:settingsTitle];
+
+    _movementStepLabel = VCamMakeLabel(@"Movement per tap", [UIFont systemFontOfSize:12 weight:UIFontWeightMedium], [UIColor colorWithWhite:1 alpha:0.82]);
+    [_settingsContainer addArrangedSubview:_movementStepLabel];
+    _movementStepSlider = [[UISlider alloc] init];
+    _movementStepSlider.minimumValue = 0;
+    _movementStepSlider.maximumValue = (float)(VCamMoveStepCount - 1);
+    _movementStepSlider.value = 3;
+    _movementStepSlider.continuous = NO;
+    _movementStepSlider.translatesAutoresizingMaskIntoConstraints = NO;
+    [_movementStepSlider addTarget:self action:@selector(movementStepChanged:) forControlEvents:UIControlEventValueChanged];
+    [_settingsContainer addArrangedSubview:_movementStepSlider];
+
+    _zoomStepLabel = VCamMakeLabel(@"Zoom per tap", [UIFont systemFontOfSize:12 weight:UIFontWeightMedium], [UIColor colorWithWhite:1 alpha:0.82]);
+    [_settingsContainer addArrangedSubview:_zoomStepLabel];
+    _zoomStepSlider = [[UISlider alloc] init];
+    _zoomStepSlider.minimumValue = 0;
+    _zoomStepSlider.maximumValue = (float)(VCamZoomStepCount - 1);
+    _zoomStepSlider.value = 3;
+    _zoomStepSlider.continuous = NO;
+    _zoomStepSlider.translatesAutoresizingMaskIntoConstraints = NO;
+    [_zoomStepSlider addTarget:self action:@selector(zoomStepChanged:) forControlEvents:UIControlEventValueChanged];
+    [_settingsContainer addArrangedSubview:_zoomStepSlider];
+
+    UILabel *settingsHint = VCamMakeLabel(@"Smaller steps give finer control. Larger steps move or zoom faster.", [UIFont systemFontOfSize:11], [UIColor colorWithWhite:1 alpha:0.58]);
+    [_settingsContainer addArrangedSubview:settingsHint];
+    [self refreshStepSettings];
 
     _logsButton = VCamMakeButton(@"View Logs", [UIColor colorWithWhite:1 alpha:0.12], self, @selector(toggleLogs));
     [stack addArrangedSubview:_logsButton];
@@ -869,6 +950,41 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     [self refreshStatus];
 }
 
+- (void)toggleSettings {
+    _settingsContainer.hidden = !_settingsContainer.hidden;
+    [_settingsButton setTitle:(_settingsContainer.hidden ? @"Settings" : @"Hide Settings") forState:UIControlStateNormal];
+    if (!_settingsContainer.hidden) [self refreshStepSettings];
+}
+
+- (void)refreshStepSettings {
+    CGFloat moveStep = VCamCurrentMoveStep();
+    CGFloat zoomStep = VCamCurrentZoomStep();
+    NSUInteger moveIndex = 0;
+    NSUInteger zoomIndex = 0;
+    for (NSUInteger index = 0; index < VCamMoveStepCount; index++) if (fabs(moveStep - VCamMoveSteps[index]) < 0.000001) moveIndex = index;
+    for (NSUInteger index = 0; index < VCamZoomStepCount; index++) if (fabs(zoomStep - VCamZoomSteps[index]) < 0.000001) zoomIndex = index;
+    _movementStepSlider.value = (float)moveIndex;
+    _zoomStepSlider.value = (float)zoomIndex;
+    _movementStepLabel.text = [NSString stringWithFormat:@"Movement per tap: %.1f%%", moveStep * 100.0];
+    _zoomStepLabel.text = [NSString stringWithFormat:@"Zoom per tap: %.2f×", zoomStep];
+}
+
+- (void)movementStepChanged:(UISlider *)slider {
+    NSInteger index = (NSInteger)lrintf(slider.value);
+    index = MAX(0, MIN((NSInteger)VCamMoveStepCount - 1, index));
+    slider.value = (float)index;
+    VCamSetSetting(VCamMoveStepKey, @(VCamMoveSteps[index]));
+    _movementStepLabel.text = [NSString stringWithFormat:@"Movement per tap: %.1f%%", VCamMoveSteps[index] * 100.0];
+}
+
+- (void)zoomStepChanged:(UISlider *)slider {
+    NSInteger index = (NSInteger)lrintf(slider.value);
+    index = MAX(0, MIN((NSInteger)VCamZoomStepCount - 1, index));
+    slider.value = (float)index;
+    VCamSetSetting(VCamZoomStepKey, @(VCamZoomSteps[index]));
+    _zoomStepLabel.text = [NSString stringWithFormat:@"Zoom per tap: %.2f×", VCamZoomSteps[index]];
+}
+
 - (void)adjustOffsetX:(CGFloat)delta {
     CGFloat value = [VCamCopySetting(VCamOffsetXKey) respondsToSelector:@selector(doubleValue)] ? [VCamCopySetting(VCamOffsetXKey) doubleValue] : 0.0;
     VCamSetSetting(VCamOffsetXKey, @(MAX(-1.0, MIN(1.0, value + delta))));
@@ -880,10 +996,10 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 // The camera pixel buffer is oriented 90 degrees relative to the portrait
 // preview on this device. Map screen-space D-pad directions onto buffer axes
 // so each arrow moves the replacement in the direction shown by the UI.
-- (void)moveLeft { [self adjustOffsetY:-VCamMoveStep]; }
-- (void)moveRight { [self adjustOffsetY:VCamMoveStep]; }
-- (void)moveUp { [self adjustOffsetX:VCamMoveStep]; }
-- (void)moveDown { [self adjustOffsetX:-VCamMoveStep]; }
+- (void)moveLeft { [self adjustOffsetY:-VCamCurrentMoveStep()]; }
+- (void)moveRight { [self adjustOffsetY:VCamCurrentMoveStep()]; }
+- (void)moveUp { [self adjustOffsetX:VCamCurrentMoveStep()]; }
+- (void)moveDown { [self adjustOffsetX:-VCamCurrentMoveStep()]; }
 - (void)resetPosition { VCamSetSetting(VCamOffsetXKey, @0.0); VCamSetSetting(VCamOffsetYKey, @0.0); }
 // Core Image uses a y-up coordinate system: positive angles rotate
 // counter-clockwise on screen. Keep the button labels aligned with that
@@ -896,8 +1012,8 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     NSInteger value = [VCamCopySetting(VCamRotationKey) integerValue];
     VCamSetSetting(VCamRotationKey, @((value - 90 + 360) % 360));
 }
-- (void)zoomIn { CGFloat value = [VCamCopySetting(VCamZoomKey) respondsToSelector:@selector(doubleValue)] ? [VCamCopySetting(VCamZoomKey) doubleValue] : 1.0; VCamSetSetting(VCamZoomKey, @(MIN(10.0, value + 0.1))); }
-- (void)zoomOut { CGFloat value = [VCamCopySetting(VCamZoomKey) respondsToSelector:@selector(doubleValue)] ? [VCamCopySetting(VCamZoomKey) doubleValue] : 1.0; VCamSetSetting(VCamZoomKey, @(MAX(0.1, value - 0.1))); }
+- (void)zoomIn { CGFloat value = [VCamCopySetting(VCamZoomKey) respondsToSelector:@selector(doubleValue)] ? [VCamCopySetting(VCamZoomKey) doubleValue] : 1.0; VCamSetSetting(VCamZoomKey, @(MIN(10.0, value + VCamCurrentZoomStep()))); }
+- (void)zoomOut { CGFloat value = [VCamCopySetting(VCamZoomKey) respondsToSelector:@selector(doubleValue)] ? [VCamCopySetting(VCamZoomKey) doubleValue] : 1.0; VCamSetSetting(VCamZoomKey, @(MAX(0.1, value - VCamCurrentZoomStep()))); }
 @end
 
 @implementation VCamMenuPresenter
