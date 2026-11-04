@@ -178,6 +178,8 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     UISlider *_zoomStepSlider;
     UIButton *_backdrop;
     UIView *_panel;
+    NSLayoutConstraint *_panelWidthConstraint;
+    NSLayoutConstraint *_panelHeightConstraint;
     UIStackView *_logsContainer;
     VCamPassThroughView *_passThroughView;
     UIButton *_floatingControl;
@@ -237,11 +239,13 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     [self.view addSubview:blur];
     CGFloat panelWidth = MIN(UIScreen.mainScreen.bounds.size.width - 32.0, 350.0);
     CGFloat panelHeight = MIN(UIScreen.mainScreen.bounds.size.height - 72.0, 470.0);
+    _panelWidthConstraint = [blur.widthAnchor constraintEqualToConstant:panelWidth];
+    _panelHeightConstraint = [blur.heightAnchor constraintEqualToConstant:panelHeight];
     [NSLayoutConstraint activateConstraints:@[
         [blur.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
         [blur.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor],
-        [blur.widthAnchor constraintEqualToConstant:panelWidth],
-        [blur.heightAnchor constraintEqualToConstant:panelHeight]
+        _panelWidthConstraint,
+        _panelHeightConstraint
     ]];
 
     UIScrollView *scrollView = [[UIScrollView alloc] init];
@@ -371,6 +375,16 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
     [self setupFloatingControl];
     [self refreshStatus];
+
+    // Keep the SpringBoard scene portrait-only (so Home Screen rotation is
+    // unaffected), but rotate only the VCam menu panel to follow the physical
+    // device orientation while the scene itself remains portrait.
+    [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(deviceOrientationDidChange:)
+                                                 name:UIDeviceOrientationDidChangeNotification
+                                               object:nil];
+    [self updatePanelForDeviceOrientation:UIDevice.currentDevice.orientation];
     [self setMenuVisible:NO];
 }
 
@@ -585,7 +599,56 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     [self setMenuVisible:YES];
 }
 
+- (void)deviceOrientationDidChange:(NSNotification *)notification {
+    (void)notification;
+    UIDeviceOrientation orientation = UIDevice.currentDevice.orientation;
+    if (orientation != UIDeviceOrientationPortrait &&
+        orientation != UIDeviceOrientationLandscapeLeft &&
+        orientation != UIDeviceOrientationLandscapeRight) {
+        // Ignore face-up/face-down/unknown transitions to avoid snapping the
+        // panel back to portrait while the device is being moved.
+        return;
+    }
+
+    if ([NSThread isMainThread]) {
+        [self updatePanelForDeviceOrientation:orientation];
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self updatePanelForDeviceOrientation:orientation];
+        });
+    }
+}
+
+- (void)updatePanelForDeviceOrientation:(UIDeviceOrientation)orientation {
+    if (!_panel || !_panelWidthConstraint || !_panelHeightConstraint) return;
+
+    BOOL landscape = (orientation == UIDeviceOrientationLandscapeLeft ||
+                      orientation == UIDeviceOrientationLandscapeRight);
+    CGSize bounds = self.view.bounds.size;
+    CGFloat shortEdge = MIN(bounds.width, bounds.height);
+    CGFloat longEdge = MAX(bounds.width, bounds.height);
+
+    if (landscape) {
+        // The controller/window stays portrait. Use a landscape-sized panel
+        // in its own coordinate space and rotate just this panel, keeping its
+        // transformed bounds inside the portrait SpringBoard scene.
+        _panelWidthConstraint.constant = MIN(longEdge - 72.0, 470.0);
+        _panelHeightConstraint.constant = MIN(shortEdge - 32.0, 350.0);
+        CGFloat angle = (orientation == UIDeviceOrientationLandscapeLeft) ? (CGFloat)-M_PI_2 : (CGFloat)M_PI_2;
+        _panel.transform = CGAffineTransformMakeRotation(angle);
+    } else {
+        _panelWidthConstraint.constant = MIN(shortEdge - 32.0, 350.0);
+        _panelHeightConstraint.constant = MIN(longEdge - 72.0, 470.0);
+        _panel.transform = CGAffineTransformIdentity;
+    }
+
+    [self.view setNeedsLayout];
+    [self.view layoutIfNeeded];
+}
+
 - (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:UIDeviceOrientationDidChangeNotification object:nil];
+    [[UIDevice currentDevice] endGeneratingDeviceOrientationNotifications];
     [_diagnosticTimer invalidate];
 }
 
@@ -707,6 +770,7 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 - (void)setMenuVisible:(BOOL)visible {
     if (!self.isViewLoaded) return;
     sMenuVisible = visible;
+    [self updatePanelForDeviceOrientation:UIDevice.currentDevice.orientation];
     _passThroughView.menuVisible = visible;
     _backdrop.hidden = !visible;
     _panel.hidden = !visible;
