@@ -13,7 +13,7 @@
 static NSInteger sPendingVolumeDirection = 0;
 static CFTimeInterval sPendingVolumeTime = 0;
 static CFTimeInterval sLastMenuToggleTime = 0;
-static const CFTimeInterval VCamChordWindow = 0.85;
+static const CFTimeInterval VCamChordWindow = 0.16; // Only treat near-simultaneous presses as a chord.
 static const CFTimeInterval VCamToggleDebounce = 0.90;
 static NSUInteger sVolumeHookAttempts = 0;
 static BOOL sVolumeHooksInstalled = NO;
@@ -35,9 +35,19 @@ static void VCamRegisterVolumeDirection(NSInteger direction) {
         }
 
         if (sPendingVolumeDirection == 0) {
+            // Start a short chord candidate window. A single volume press is
+            // never delayed or swallowed; the original SpringBoard action
+            // still runs in the hook below.
             sPendingVolumeDirection = direction;
             sPendingVolumeTime = now;
-        } else if (direction != sPendingVolumeDirection) {
+        } else if (direction == sPendingVolumeDirection) {
+            // Repeated presses of the same volume key are normal volume
+            // adjustments, not the beginning of an Up+Down chord.
+            sPendingVolumeDirection = 0;
+            sPendingVolumeTime = 0;
+        } else {
+            // The opposite key arrived within the short simultaneous-press
+            // window. Only this deliberate two-key chord toggles the menu.
             shouldToggle = YES;
             sPendingVolumeDirection = 0;
             sPendingVolumeTime = 0;
