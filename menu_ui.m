@@ -186,6 +186,23 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     NSTimer *_diagnosticTimer;
 }
 
+// The overlay is attached to SpringBoard's scene for its entire lifetime.
+// UIKit otherwise treats this full-screen controller as an autorotating
+// participant in the scene and may rotate the Home Screen when device
+// orientation changes. SpringBoard on this iPhone should remain portrait;
+// this controller must never request or advertise landscape support.
+- (BOOL)shouldAutorotate {
+    return NO;
+}
+
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations {
+    return UIInterfaceOrientationMaskPortrait;
+}
+
+- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
+    return UIInterfaceOrientationPortrait;
+}
+
 - (void)loadView {
     _passThroughView = [[VCamPassThroughView alloc] initWithFrame:UIScreen.mainScreen.bounds];
     _passThroughView.backgroundColor = UIColor.clearColor;
