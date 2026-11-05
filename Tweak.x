@@ -32,6 +32,12 @@
         NSLog(@"[VCam] first video frame reached BWNodeOutput (%@)", dimensions);
     });
 
+    uint64_t hookFrameCount = __atomic_add_fetch(&sVCamHookFrameCount, 1, __ATOMIC_RELAXED);
+    if ((hookFrameCount % 30) == 0) {
+        VCamSetRuntimeStatus(@"cameraHookFrameCount", @(hookFrameCount));
+        VCamSetRuntimeStatus(@"cameraHookLastFrameAt", [NSDate date]);
+    }
+
     CVPixelBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!imageBuffer) {
         %orig(sampleBuffer);
@@ -60,6 +66,7 @@
 static void *sCMCaptureHandle = NULL;
 static BOOL sVCamHookInstalled = NO;
 static NSUInteger sVCamHookAttempts = 0;
+static uint64_t sVCamHookFrameCount = 0;
 
 static void VCamTryInstallCaptureHook(void) {
     if (sVCamHookInstalled) return;
