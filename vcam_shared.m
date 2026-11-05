@@ -266,6 +266,49 @@ void VCamSetSetting(NSString *key, id value) {
     VCamPublishStringSetting(key, VCamSerializeSettingValue(key, value));
 }
 
+
+// Publish the hot-path diagnostics through Darwin notify. /tmp can be presented
+// through different RootHide filesystem views, while notify state is shared.
+static NSString *VCamRuntimeNotifyName(NSString *key) {
+    return [NSString stringWithFormat:@"%@.runtime.mediaserverd.%@", VCamPreferenceDomain, key];
+}
+
+static void VCamPublishRuntimeCounter(NSString *key, uint64_t value) {
+    int token = VCamNotifyTokenForName(VCamRuntimeNotifyName(key));
+    if (token == NOTIFY_TOKEN_INVALID) return;
+    notify_set_state(token, value);
+    notify_post(VCamRuntimeNotifyName(key).UTF8String);
+}
+
+static uint64_t VCamReadRuntimeCounter(NSString *key) {
+    int token = VCamNotifyTokenForName(VCamRuntimeNotifyName(key));
+    uint64_t value = 0;
+    if (token == NOTIFY_TOKEN_INVALID || notify_get_state(token, &value) != NOTIFY_STATUS_OK) return 0;
+    return value;
+}
+
+static uint64_t VCamRenderSkipCode(NSString *reason) {
+    if ([reason isEqualToString:@"replacement-disabled"]) return 1;
+    if ([reason isEqualToString:@"media-not-ready"]) return 2;
+    if ([reason isEqualToString:@"render-context-unavailable"]) return 3;
+    if ([reason isEqualToString:@"image-source-unavailable"]) return 4;
+    if ([reason isEqualToString:@"video-frame-not-ready"]) return 5;
+    if ([reason isEqualToString:@"camera-buffer-has-zero-size"]) return 6;
+    return 0;
+}
+
+static NSString *VCamRenderSkipReasonForCode(uint64_t code) {
+    switch (code) {
+        case 1: return @"replacement-disabled";
+        case 2: return @"media-not-ready";
+        case 3: return @"render-context-unavailable";
+        case 4: return @"image-source-unavailable";
+        case 5: return @"video-frame-not-ready";
+        case 6: return @"camera-buffer-has-zero-size";
+        default: return nil;
+    }
+}
+
 NSDictionary *VCamCopyRuntimeStatus(void) {
     NSMutableDictionary *daemonStatuses = [NSMutableDictionary dictionary];
     NSDictionary *newestStatus = nil;
@@ -285,6 +328,13 @@ NSDictionary *VCamCopyRuntimeStatus(void) {
         if (heartbeatCurrent && ![status[@"runtimeVersion"] isEqualToString:VCamRuntimeVersion]) {
             status[@"runtimeVersion"] = VCamRuntimeVersion;
             status[@"daemonPID"] = @0; // heartbeat proves the injected runtime is alive; PID may be sandbox-hidden.
+        }
+        if ([processName isEqualToString:@"mediaserverd"]) {
+            status[@"cameraHookFrameCount"] = @(VCamReadRuntimeCounter(@"cameraHookFrameCount"));
+            status[@"replacementRenderCount"] = @(VCamReadRuntimeCounter(@"replacementRenderCount"));
+            NSString *skipReason = VCamRenderSkipReasonForCode(VCamReadRuntimeCounter(@"renderSkipReason"));
+            if (skipReason) status[@"renderSkipReason"] = skipReason;
+            else [status removeObjectForKey:@"renderSkipReason"];
         }
         daemonStatuses[processName] = [status copy];
 
@@ -313,6 +363,13 @@ void VCamSetRuntimeStatus(NSString *key, id value) {
         if (!value && !oldValue) return;
         if (value) status[key] = value;
         else [status removeObjectForKey:key];
+
+        if ([key isEqualToString:@"cameraHookFrameCount"] || [key isEqualToString:@"replacementRenderCount"]) {
+            VCamPublishRuntimeCounter(key, value ? [value unsignedLongLongValue] : 0);
+        } else if ([key isEqualToString:@"renderSkipReason"]) {
+            VCamPublishRuntimeCounter(key, value ? VCamRenderSkipCode([value description]) : 0);
+        }
+
         if (!VCamEnsureRuntimeStatusDirectory()) return;
         BOOL didWrite = [status writeToFile:path atomically:YES];
         if (didWrite) chmod(path.fileSystemRepresentation, 0644);
@@ -345,6 +402,11 @@ void VCamResetRuntimeStatus(void) {
     // Publish immediately, then refresh every 2 seconds. A stale state expires
     // after 8 seconds in SpringBoard, so a crashed/restarted daemon is detected.
     VCamPublishHeartbeatForProcess(processName);
+    if ([processName isEqualToString:@"mediaserverd"]) {
+        VCamPublishRuntimeCounter(@"cameraHookFrameCount", 0);
+        VCamPublishRuntimeCounter(@"replacementRenderCount", 0);
+        VCamPublishRuntimeCounter(@"renderSkipReason", 0);
+    }
     static dispatch_source_t heartbeatTimer;
     static dispatch_once_t timerOnce;
     dispatch_once(&timerOnce, ^{
