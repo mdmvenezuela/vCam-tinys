@@ -5,8 +5,6 @@
 #import <dlfcn.h>
 #import <dispatch/dispatch.h>
 
-static uint64_t sVCamHookFrameCount = 0;
-
 // BWNodeOutput is declared by Apple's private CMCapture framework. On some
 // iOS builds it is not registered when a camera daemon first loads third-party
 // tweaks. Load CMCapture explicitly, then install the Logos group only after
@@ -16,6 +14,7 @@ static uint64_t sVCamHookFrameCount = 0;
 %hook BWNodeOutput
 
 - (void)emitSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+    static uint64_t sVCamHookFrameCount = 0;
     unsigned int mediaType = ((unsigned int (*)(id, SEL))objc_msgSend)(self, sel_registerName("mediaType"));
     if (mediaType != 'vide') {
         %orig(sampleBuffer);
@@ -35,7 +34,7 @@ static uint64_t sVCamHookFrameCount = 0;
     });
 
     uint64_t hookFrameCount = __atomic_add_fetch(&sVCamHookFrameCount, 1, __ATOMIC_RELAXED);
-    if ((hookFrameCount % 30) == 0) {
+    if (hookFrameCount == 1 || (hookFrameCount % 30) == 0) {
         VCamSetRuntimeStatus(@"cameraHookFrameCount", @(hookFrameCount));
         VCamSetRuntimeStatus(@"cameraHookLastFrameAt", [NSDate date]);
     }
