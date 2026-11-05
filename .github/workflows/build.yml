@@ -14,7 +14,7 @@ permissions:
 jobs:
   build:
     name: Build rootless and RootHide packages
-    runs-on: macos-14
+    runs-on: macos-14-large
     env:
       THEOS: ${{ github.workspace }}/theos
     steps:
