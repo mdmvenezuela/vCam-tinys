@@ -364,5 +364,5 @@ void VCamResetRuntimeStatus(void) {
 NSString *VCamMediaDirectory(void) {
     // Keep replacement files in the same shared temporary area that worked
     // with the original mediaserverd implementation (/tmp/test.png).
-    return @"/tmp/VCamMedia";
+    return @"/var/tmp/VCamMedia";
 }
