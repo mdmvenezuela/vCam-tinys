@@ -538,7 +538,18 @@ void drawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
     CGColorSpaceRef renderColorSpace = NULL;
 
     @synchronized (sLock) {
-        if (!sEnabled || sCurrentMode == VCamModeNone || !sRenderContext) return;
+        if (!sEnabled) {
+            VCamSetRuntimeStatus(@"renderSkipReason", @"replacement-disabled");
+            return;
+        }
+        if (sCurrentMode == VCamModeNone) {
+            VCamSetRuntimeStatus(@"renderSkipReason", @"media-not-ready");
+            return;
+        }
+        if (!sRenderContext || !sRenderColorSpace) {
+            VCamSetRuntimeStatus(@"renderSkipReason", @"render-context-unavailable");
+            return;
+        }
         mode = sCurrentMode;
         replacementImage = sReplacementImage;
         videoTransform = sVideoPreferredTransform;
@@ -575,6 +586,9 @@ void drawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
 
     if (!source) {
         if (videoBuffer) CVPixelBufferRelease(videoBuffer);
+        VCamSetRuntimeStatus(@"renderSkipReason", mode == VCamModeImage
+                             ? @"image-source-unavailable"
+                             : @"video-frame-not-ready");
         return;
     }
 
@@ -582,6 +596,7 @@ void drawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
     size_t targetHeight = CVPixelBufferGetHeight(targetBuffer);
     if (targetWidth == 0 || targetHeight == 0) {
         if (videoBuffer) CVPixelBufferRelease(videoBuffer);
+        VCamSetRuntimeStatus(@"renderSkipReason", @"camera-buffer-has-zero-size");
         return;
     }
     CGRect targetRect = CGRectMake(0, 0, targetWidth, targetHeight);
@@ -611,6 +626,7 @@ void drawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
                           imageByCroppingToRect:targetRect];
     CIImage *finalImage = [[source imageByCompositingOverImage:background] imageByCroppingToRect:targetRect];
     [renderContext render:finalImage toCVPixelBuffer:targetBuffer bounds:targetRect colorSpace:renderColorSpace];
+    VCamSetRuntimeStatus(@"renderSkipReason", nil);
 
     // Count completed CIContext render calls independently from the one-time
     // replacementRendered flag. Publish at 30-frame intervals to avoid writing
