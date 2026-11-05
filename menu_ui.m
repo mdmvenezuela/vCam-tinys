@@ -700,6 +700,9 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [NSString stringWithFormat:@"Video frame pump: %@ (%@)", videoPump.uppercaseString, videoFrameSize],
         mediaLine,
         outputLine,
+        [NSString stringWithFormat:@"Hook frames observed: %@", runtime[@"cameraHookFrameCount"] ?: @0],
+        [NSString stringWithFormat:@"Replacement renders completed: %@", runtime[@"replacementRenderCount"] ?: @0],
+        [NSString stringWithFormat:@"Last render size: %@", runtime[@"replacementRenderLastSize"] ?: @"not recorded"],
         @"Camera coverage: front and rear live preview streams"
     ]];
     if (hookDetail.length) [lines addObject:[@"Hook detail: " stringByAppendingString:hookDetail]];
@@ -728,7 +731,7 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     } else if (!rendered) {
         [lines addObject:@"Action: wait for the camera frame to be replaced, then check Media above."];
     } else {
-        [lines addObject:@"Status: replacement frames are being submitted to the live camera stream."];
+        [lines addObject:@"Status: at least one replacement render completed; use the counters above to confirm continuous rendering."];
     }
     return [lines componentsJoinedByString:@"\n"];
 }
