@@ -703,6 +703,7 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [NSString stringWithFormat:@"Hook frames observed: %@", runtime[@"cameraHookFrameCount"] ?: @0],
         [NSString stringWithFormat:@"Replacement renders completed: %@", runtime[@"replacementRenderCount"] ?: @0],
         [NSString stringWithFormat:@"Last render size: %@", runtime[@"replacementRenderLastSize"] ?: @"not recorded"],
+        [NSString stringWithFormat:@"Render skip reason: %@", runtime[@"renderSkipReason"] ?: @"none — render path reached"],
         @"Camera coverage: front and rear live preview streams"
     ]];
     if (hookDetail.length) [lines addObject:[@"Hook detail: " stringByAppendingString:hookDetail]];
