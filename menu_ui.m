@@ -991,34 +991,48 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         NSString *directory = VCamMediaDirectory();
         NSFileManager *fileManager = NSFileManager.defaultManager;
         NSError *directoryError = nil;
-        [fileManager createDirectoryAtPath:directory
-               withIntermediateDirectories:YES
-                                attributes:@{ NSFilePosixPermissions: @0755 }
-                                     error:&directoryError];
-        if (directoryError) {
-            dispatch_async(dispatch_get_main_queue(), ^{ self->_statusLabel.text = @"Could not create shared media folder"; });
+        BOOL directoryCreated = [fileManager createDirectoryAtPath:directory
+                                       withIntermediateDirectories:YES
+                                                        attributes:@{ NSFilePosixPermissions: @0777 }
+                                                             error:&directoryError];
+        if (!directoryCreated || directoryError) {
+            NSString *reason = directoryError.localizedDescription ?: @"createDirectory returned NO";
+            NSLog(@"[VCam] media directory creation failed at %@: %@", directory, reason);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self->_statusLabel.text = [NSString stringWithFormat:@"Media folder failed: %@", reason];
+            });
             return;
         }
+        chmod(directory.fileSystemRepresentation, 0777);
 
         NSString *extension = temporaryURL.pathExtension.lowercaseString;
         if (extension.length == 0) extension = [typeIdentifier isEqualToString:VCamMovieTypeIdentifier] ? @"mov" : @"jpg";
         NSString *filename = [NSString stringWithFormat:@"media-%@.%@", [[NSUUID UUID] UUIDString], extension];
         NSString *destination = [directory stringByAppendingPathComponent:filename];
         NSError *copyError = nil;
-        [fileManager copyItemAtURL:temporaryURL toURL:[NSURL fileURLWithPath:destination] error:&copyError];
-        if (copyError) {
-            dispatch_async(dispatch_get_main_queue(), ^{ self->_statusLabel.text = @"Could not save selected media"; });
+        BOOL copied = [fileManager copyItemAtURL:temporaryURL toURL:[NSURL fileURLWithPath:destination] error:&copyError];
+        if (!copied || copyError) {
+            NSString *reason = copyError.localizedDescription ?: @"copyItemAtURL returned NO";
+            NSLog(@"[VCam] media copy failed from %@ to %@: %@", temporaryURL.path, destination, reason);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self->_statusLabel.text = [NSString stringWithFormat:@"Media copy failed: %@", reason];
+            });
             return;
         }
 
-        chmod(directory.fileSystemRepresentation, 0755);
         chmod(destination.fileSystemRepresentation, 0644);
-        NSDictionary *attributes = [fileManager attributesOfItemAtPath:destination error:nil];
-        if (![attributes[NSFileType] isEqualToString:NSFileTypeRegular]) {
+        NSDictionary *attributes = [fileManager attributesOfItemAtPath:destination error:&copyError];
+        unsigned long long fileSize = [attributes[NSFileSize] unsignedLongLongValue];
+        if (![attributes[NSFileType] isEqualToString:NSFileTypeRegular] || fileSize == 0) {
+            NSString *reason = copyError.localizedDescription ?: @"saved file is missing, empty, or not regular";
+            NSLog(@"[VCam] media verification failed at %@: %@", destination, reason);
             [fileManager removeItemAtPath:destination error:nil];
-            dispatch_async(dispatch_get_main_queue(), ^{ self->_statusLabel.text = @"The selected media is not a regular file"; });
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self->_statusLabel.text = [NSString stringWithFormat:@"Media verification failed: %@", reason];
+            });
             return;
         }
+        NSLog(@"[VCam] media saved and verified: %@ (%llu bytes)", destination, fileSize);
 
         if ([typeIdentifier isEqualToString:VCamMovieTypeIdentifier]) {
             NSString *optimizedFilename = [[filename stringByDeletingPathExtension] stringByAppendingString:@"-optimized.mp4"];
