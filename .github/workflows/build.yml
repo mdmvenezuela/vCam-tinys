@@ -1,4 +1,5 @@
 name: Build VCam DEB packages
+# Build includes continuous camera-hook and replacement-render diagnostics.
 
 on:
   push:
