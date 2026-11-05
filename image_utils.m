@@ -43,6 +43,7 @@ static BOOL sIsLoading = NO;
 static NSString *sRequestedPath = nil;
 static NSString *sLoadedPath = nil;
 static BOOL sHasLoggedFirstRender = NO;
+static uint64_t sReplacementRenderCount = 0;
 static dispatch_queue_t sVideoFrameQueue = nil;
 static dispatch_source_t sVideoFrameTimer = nil;
 static BOOL sHasLoggedFirstVideoFrame = NO;
@@ -610,6 +611,19 @@ void drawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
                           imageByCroppingToRect:targetRect];
     CIImage *finalImage = [[source imageByCompositingOverImage:background] imageByCroppingToRect:targetRect];
     [renderContext render:finalImage toCVPixelBuffer:targetBuffer bounds:targetRect colorSpace:renderColorSpace];
+
+    // Count completed CIContext render calls independently from the one-time
+    // replacementRendered flag. Publish at 30-frame intervals to avoid writing
+    // the runtime plist on every real-time camera callback.
+    uint64_t renderCount = 0;
+    @synchronized (sLock) {
+        renderCount = ++sReplacementRenderCount;
+    }
+    if ((renderCount % 30) == 0) {
+        VCamSetRuntimeStatus(@"replacementRenderCount", @(renderCount));
+        VCamSetRuntimeStatus(@"replacementRenderLastAt", [NSDate date]);
+        VCamSetRuntimeStatus(@"replacementRenderLastSize", [NSString stringWithFormat:@"%zux%zu", targetWidth, targetHeight]);
+    }
 
     if (videoBuffer) CVPixelBufferRelease(videoBuffer);
 
