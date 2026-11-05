@@ -619,7 +619,7 @@ void drawReplacementOntoBuffer(CVPixelBufferRef targetBuffer) {
     @synchronized (sLock) {
         renderCount = ++sReplacementRenderCount;
     }
-    if ((renderCount % 30) == 0) {
+    if (renderCount == 1 || (renderCount % 30) == 0) {
         VCamSetRuntimeStatus(@"replacementRenderCount", @(renderCount));
         VCamSetRuntimeStatus(@"replacementRenderLastAt", [NSDate date]);
         VCamSetRuntimeStatus(@"replacementRenderLastSize", [NSString stringWithFormat:@"%zux%zu", targetWidth, targetHeight]);
