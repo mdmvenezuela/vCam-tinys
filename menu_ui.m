@@ -661,8 +661,14 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
     NSString *processName = [runtime[@"daemonProcess"] isKindOfClass:[NSString class]] ? runtime[@"daemonProcess"] : @"mediaserverd";
     NSString *hookState = [runtime[@"hookState"] isKindOfClass:[NSString class]] ? runtime[@"hookState"] : @"unknown";
-    BOOL framesSeen = [runtime[@"cameraFramesSeen"] boolValue];
-    BOOL rendered = [runtime[@"replacementRendered"] boolValue];
+    uint64_t emitCallbackCount = [runtime[@"cameraEmitCallbackCount"] respondsToSelector:@selector(unsignedLongLongValue)]
+        ? [runtime[@"cameraEmitCallbackCount"] unsignedLongLongValue] : 0;
+    uint64_t hookFrameCount = [runtime[@"cameraHookFrameCount"] respondsToSelector:@selector(unsignedLongLongValue)]
+        ? [runtime[@"cameraHookFrameCount"] unsignedLongLongValue] : 0;
+    uint64_t renderCount = [runtime[@"replacementRenderCount"] respondsToSelector:@selector(unsignedLongLongValue)]
+        ? [runtime[@"replacementRenderCount"] unsignedLongLongValue] : 0;
+    BOOL framesSeen = hookFrameCount > 0;
+    BOOL rendered = renderCount > 0;
     NSString *mediaState = [runtime[@"mediaState"] isKindOfClass:[NSString class]] ? runtime[@"mediaState"] : @"not-checked";
     NSString *mediaDetail = [runtime[@"mediaDetail"] isKindOfClass:[NSString class]] ? runtime[@"mediaDetail"] : @"";
     NSString *hookDetail = [runtime[@"hookDetail"] isKindOfClass:[NSString class]] ? runtime[@"hookDetail"] : @"";
@@ -671,12 +677,18 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
     NSString *daemonLine = mediaLoaded ? [NSString stringWithFormat:@"Camera daemon injection: YES (%@)", processName] : @"Camera daemon injection: NO HEARTBEAT from mediaserverd";
     NSString *heartbeatLine = heartbeatAge >= 0 ? [NSString stringWithFormat:@"mediaserverd heartbeat: %@ (%lds ago)", mediaLoaded ? @"ALIVE" : @"STALE", (long)heartbeatAge] : @"mediaserverd heartbeat: NOT RECEIVED";
-    NSString *frameLine = framesSeen ? [NSString stringWithFormat:@"Camera frames: RECEIVED (%@)", runtime[@"cameraFrameSize"] ?: @"size unknown"] : @"Camera frames: WAITING (open Camera and start preview)";
+    NSString *frameLine = framesSeen
+        ? [NSString stringWithFormat:@"Camera frames: RECEIVED (%@)", runtime[@"cameraFrameSize"] ?: @"size unknown"]
+        : (emitCallbackCount > 0
+            ? @"Camera frames: callback reached, but no video pixel buffers were accepted"
+            : @"Camera frames: NOT INTERCEPTED (emitSampleBuffer callback count is zero)");
     NSString *mediaLine = [NSString stringWithFormat:@"Media: %@%@", mediaState.uppercaseString, mediaDetail.length ? [@" — " stringByAppendingString:mediaDetail] : @""];
     NSString *enabledLine = [runtime[@"replacementEnabled"] respondsToSelector:@selector(boolValue)]
         ? [NSString stringWithFormat:@"Replacement state (mediaserverd): %@", [runtime[@"replacementEnabled"] boolValue] ? @"ON" : @"OFF"]
         : @"Replacement state (mediaserverd): WAITING";
-    NSString *outputLine = rendered ? [NSString stringWithFormat:@"Buffer render call: SENT (%@)", runtime[@"renderedFrameSize"] ?: @"size unknown"] : @"Buffer render call: NOT SENT YET";
+    NSString *outputLine = rendered
+        ? [NSString stringWithFormat:@"Buffer render call: SENT (%@)", runtime[@"replacementRenderLastSize"] ?: runtime[@"renderedFrameSize"] ?: @"size unknown"]
+        : @"Buffer render call: NOT COMPLETED";
     BOOL selectionReceived = [runtime[@"mediaSelectionReceived"] boolValue];
     NSString *selectionName = [runtime[@"mediaSelectionFilename"] isKindOfClass:NSString.class] ? runtime[@"mediaSelectionFilename"] : @"";
     NSString *selectionLine = selectionReceived
@@ -700,10 +712,11 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [NSString stringWithFormat:@"Video frame pump: %@ (%@)", videoPump.uppercaseString, videoFrameSize],
         mediaLine,
         outputLine,
-        [NSString stringWithFormat:@"Hook frames observed: %@", runtime[@"cameraHookFrameCount"] ?: @0],
-        [NSString stringWithFormat:@"Replacement renders completed: %@", runtime[@"replacementRenderCount"] ?: @0],
+        [NSString stringWithFormat:@"emitSampleBuffer callbacks: %llu", (unsigned long long)emitCallbackCount],
+        [NSString stringWithFormat:@"Hook video frames observed: %llu", (unsigned long long)hookFrameCount],
+        [NSString stringWithFormat:@"Replacement renders completed: %llu", (unsigned long long)renderCount],
         [NSString stringWithFormat:@"Last render size: %@", runtime[@"replacementRenderLastSize"] ?: @"not recorded"],
-        [NSString stringWithFormat:@"Render skip reason: %@", runtime[@"renderSkipReason"] ?: @"none — render path reached"],
+        [NSString stringWithFormat:@"Render skip reason: %@", runtime[@"renderSkipReason"] ?: (renderCount > 0 ? @"none — render completed" : (hookFrameCount > 0 ? @"no render completed" : (emitCallbackCount > 0 ? @"no video frame accepted" : @"emitSampleBuffer callback not reached"))) ],
         @"Camera coverage: front and rear live preview streams"
     ]];
     if (hookDetail.length) [lines addObject:[@"Hook detail: " stringByAppendingString:hookDetail]];
@@ -715,10 +728,12 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
     if (!mediaLoaded) {
         [lines addObject:@"Action: enable Tweak Injection in Relaxin and run a Userspace Reboot."];
-    } else if (![hookState isEqualToString:@"installed"]) {
+    } else if (![hookState hasPrefix:@"installed"]) {
         [lines addObject:@"Action: the camera hook is not installed. Check Hook detail."];
+    } else if (emitCallbackCount == 0) {
+        [lines addObject:@"Action: mediaserverd is alive, but BWNodeOutput emitSampleBuffer has not been intercepted. The camera delivery path is still outside this hook."];
     } else if (!framesSeen) {
-        [lines addObject:@"Action: open the built-in Camera app and start a live preview."];
+        [lines addObject:@"Action: emitSampleBuffer is being called, but it is not delivering a video pixel buffer accepted by this hook."];
     } else if ([mediaState isEqualToString:@"disabled"]) {
         [lines addObject:@"Action: enable Replacement."];
     } else if ([mediaState isEqualToString:@"no-selection"]) {
@@ -730,9 +745,9 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     } else if ([mediaState containsString:@"failed"] || [mediaState containsString:@"not-found"] || [mediaState containsString:@"missing"]) {
         [lines addObject:@"Action: choose the media again and check Media file access."];
     } else if (!rendered) {
-        [lines addObject:@"Action: wait for the camera frame to be replaced, then check Media above."];
+        [lines addObject:@"Action: camera frames reached the hook, but CIContext has not completed a replacement render. Check Render skip reason and Render error."];
     } else {
-        [lines addObject:@"Status: at least one replacement render completed; use the counters above to confirm continuous rendering."];
+        [lines addObject:@"Status: replacement render confirmed by the completed-render counter."];
     }
     return [lines componentsJoinedByString:@"\n"];
 }
