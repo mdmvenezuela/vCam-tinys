@@ -5,6 +5,7 @@
 #import <substrate.h>
 #import <dlfcn.h>
 #import <dispatch/dispatch.h>
+#import <stdlib.h>
 #import <AVFoundation/AVFoundation.h>
 
 // Hook BWNodeOutput and every concrete subclass that overrides
@@ -17,6 +18,23 @@ static BOOL sVCamHookInstalled = NO;
 static NSUInteger sVCamHookAttempts = 0;
 static uint64_t sVCamHookFrameCount = 0;
 static __thread int sVCamHookRecursionDepth = 0;
+
+// Return YES only when this class declares the selector itself, rather than inheriting it.
+// class_getInstanceMethod() is not sufficient here because it also searches superclasses.
+static BOOL VCamClassImplementsSelectorDirectly(Class cls, SEL selector) {
+    if (!cls || !selector) return NO;
+    unsigned int methodCount = 0;
+    Method *methods = class_copyMethodList(cls, &methodCount);
+    BOOL found = NO;
+    for (unsigned int index = 0; index < methodCount; index++) {
+        if (method_getName(methods[index]) == selector) {
+            found = YES;
+            break;
+        }
+    }
+    free(methods);
+    return found;
+}
 
 static IMP VCamOriginalIMPForObject(id object) {
     Class cls = object_getClass(object);
