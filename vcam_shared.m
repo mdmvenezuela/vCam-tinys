@@ -13,7 +13,7 @@ NSString * const VCamOffsetYKey = @"OffsetY";
 NSString * const VCamRotationKey = @"Rotation";
 NSString * const VCamZoomKey = @"Zoom";
 NSString * const VCamVideoPausedKey = @"VideoPaused";
-NSString * const VCamRuntimeVersion = @"0.1.47";
+NSString * const VCamRuntimeVersion = @"0.1.48";
 
 static NSString *VCamPreferencesDirectory(void) {
     // Keep persistent preferences outside /tmp; only the selected media is temporary.
@@ -397,6 +397,15 @@ NSDictionary *VCamCopyRuntimeStatus(void) {
             if (VCamTryReadRuntimeCounter(@"cameraHookFrameCount", &counter)) {
                 status[@"cameraHookFrameCount"] = @(counter);
             }
+            if (VCamTryReadRuntimeCounter(@"cameraLocalPreviewSinkCount", &counter)) {
+                status[@"cameraLocalPreviewSinkCount"] = @(counter);
+            }
+            if (VCamTryReadRuntimeCounter(@"cameraRemotePreviewSinkCount", &counter)) {
+                status[@"cameraRemotePreviewSinkCount"] = @(counter);
+            }
+            if (VCamTryReadRuntimeCounter(@"cameraStillPhotoSinkCount", &counter)) {
+                status[@"cameraStillPhotoSinkCount"] = @(counter);
+            }
             if (VCamTryReadRuntimeCounter(@"replacementRenderCount", &counter)) {
                 status[@"replacementRenderCount"] = @(counter);
             }
@@ -434,7 +443,12 @@ void VCamSetRuntimeStatus(NSString *key, id value) {
         // fast-path. The plist can be stale or absent across RootHide views;
         // returning early here previously left a stale "media-not-ready"
         // reason in the shared notify state even after the render path cleared it.
-        if ([key isEqualToString:@"cameraEmitCallbackCount"] || [key isEqualToString:@"cameraHookFrameCount"] || [key isEqualToString:@"replacementRenderCount"]) {
+        if ([key isEqualToString:@"cameraEmitCallbackCount"] ||
+            [key isEqualToString:@"cameraHookFrameCount"] ||
+            [key isEqualToString:@"cameraLocalPreviewSinkCount"] ||
+            [key isEqualToString:@"cameraRemotePreviewSinkCount"] ||
+            [key isEqualToString:@"cameraStillPhotoSinkCount"] ||
+            [key isEqualToString:@"replacementRenderCount"]) {
             VCamPublishRuntimeCounter(key, value ? [value unsignedLongLongValue] : 0);
         } else if ([key isEqualToString:@"renderSkipReason"]) {
             VCamPublishRuntimeCounter(key, value ? VCamRenderSkipCode([value description]) : 0);
@@ -480,6 +494,9 @@ void VCamResetRuntimeStatus(void) {
     if ([processName isEqualToString:@"mediaserverd"]) {
         VCamPublishRuntimeCounter(@"cameraEmitCallbackCount", 0);
         VCamPublishRuntimeCounter(@"cameraHookFrameCount", 0);
+        VCamPublishRuntimeCounter(@"cameraLocalPreviewSinkCount", 0);
+        VCamPublishRuntimeCounter(@"cameraRemotePreviewSinkCount", 0);
+        VCamPublishRuntimeCounter(@"cameraStillPhotoSinkCount", 0);
         VCamPublishRuntimeCounter(@"replacementRenderCount", 0);
         VCamPublishRuntimeCounter(@"renderSkipReason", 0);
     }
