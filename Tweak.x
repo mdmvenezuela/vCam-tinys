@@ -8,19 +8,18 @@
 #import <stdlib.h>
 #import <AVFoundation/AVFoundation.h>
 
-// Hook BWNodeOutput and every concrete subclass that overrides
-// emitSampleBuffer:. Some camera graph nodes dispatch through subclass IMPs,
-// which a hook on BWNodeOutput alone does not intercept.
+// System-wide camera hook. Each Objective-C implementation receives its own
+// trampoline so a subclass calling super forwards to the superclass's own
+// original IMP instead of re-entering the subclass replacement.
 static void *sCMCaptureHandle = NULL;
-static NSMutableDictionary<NSString *, NSValue *> *sOriginalIMPs;
 static NSMutableSet<NSString *> *sHookedClasses;
 static BOOL sVCamHookInstalled = NO;
 static NSUInteger sVCamHookAttempts = 0;
 static uint64_t sVCamHookFrameCount = 0;
+static uint64_t sVCamEmitCallCount = 0;
 static __thread int sVCamHookRecursionDepth = 0;
+static BOOL sVCamHookScanScheduled = NO;
 
-// Return YES only when this class declares the selector itself, rather than inheriting it.
-// class_getInstanceMethod() is not sufficient here because it also searches superclasses.
 static BOOL VCamClassImplementsSelectorDirectly(Class cls, SEL selector) {
     if (!cls || !selector) return NO;
     unsigned int methodCount = 0;
@@ -36,66 +35,180 @@ static BOOL VCamClassImplementsSelectorDirectly(Class cls, SEL selector) {
     return found;
 }
 
-static IMP VCamOriginalIMPForObject(id object) {
-    Class cls = object_getClass(object);
-    @synchronized (sOriginalIMPs) {
-        for (Class current = cls; current; current = class_getSuperclass(current)) {
-            NSValue *value = sOriginalIMPs[NSStringFromClass(current)];
-            if (value) return (IMP)value.pointerValue;
-        }
+static BOOL VCamClassDescendsFrom(Class candidate, Class ancestor) {
+    if (!candidate || !ancestor || candidate == ancestor) return NO;
+    for (Class parent = class_getSuperclass(candidate); parent; parent = class_getSuperclass(parent)) {
+        if (parent == ancestor) return YES;
     }
-    return NULL;
+    return NO;
 }
 
-static void VCamEmitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuffer) {
-    IMP original = VCamOriginalIMPForObject(self);
-    if (!sampleBuffer || sVCamHookRecursionDepth > 0) {
-        if (original) ((void (*)(id, SEL, CMSampleBufferRef))original)(self, _cmd, sampleBuffer);
+static void VCamProcessCameraSampleBuffer(id output, CMSampleBufferRef sampleBuffer) {
+    if (!sampleBuffer) return;
+
+    uint64_t callbackCount = __atomic_add_fetch(&sVCamEmitCallCount, 1, __ATOMIC_RELAXED);
+    if (callbackCount == 1 || (callbackCount % 30) == 0) {
+        VCamSetRuntimeStatus(@"cameraEmitCallbackCount", @(callbackCount));
+        if (callbackCount == 1) {
+            VCamSetRuntimeStatus(@"firstEmitCallbackAt", [NSDate date]);
+            NSLog(@"[VCam] emitSampleBuffer callback reached: %@", NSStringFromClass(object_getClass(output)));
+        }
+    }
+
+    unsigned int mediaType = 0;
+    @try {
+        mediaType = ((unsigned int (*)(id, SEL))objc_msgSend)(output, sel_registerName("mediaType"));
+    } @catch (NSException *exception) {
+        VCamSetRuntimeStatus(@"hookError", [NSString stringWithFormat:@"mediaType: %@", exception.reason ?: @"unknown"]);
+        return;
+    }
+    if (mediaType != 'vide') return;
+
+    CVPixelBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (!imageBuffer) return;
+
+    uint64_t frameCount = __atomic_add_fetch(&sVCamHookFrameCount, 1, __ATOMIC_RELAXED);
+    if (frameCount == 1) {
+        NSString *dimensions = [NSString stringWithFormat:@"%zux%zu",
+            CVPixelBufferGetWidth(imageBuffer), CVPixelBufferGetHeight(imageBuffer)];
+        VCamSetRuntimeStatus(@"cameraFramesSeen", @YES);
+        VCamSetRuntimeStatus(@"firstCameraFrameAt", [NSDate date]);
+        VCamSetRuntimeStatus(@"cameraFrameSize", dimensions);
+        NSLog(@"[VCam] first video frame intercepted by %@ (%@)",
+              NSStringFromClass(object_getClass(output)), dimensions);
+    }
+    if (frameCount == 1 || (frameCount % 30) == 0) {
+        VCamSetRuntimeStatus(@"cameraHookFrameCount", @(frameCount));
+        VCamSetRuntimeStatus(@"cameraHookLastFrameAt", [NSDate date]);
+    }
+
+    @autoreleasepool {
+        loadReplacementMedia();
+        @try {
+            drawReplacementOntoBuffer(imageBuffer);
+        } @catch (NSException *exception) {
+            VCamSetRuntimeStatus(@"renderError", exception.reason ?: @"Unknown render exception");
+            NSLog(@"[VCam] Failed to render replacement media: %@", exception);
+        }
+    }
+}
+
+static BOOL VCamInstallCameraMethodHook(Class candidate, SEL selector) {
+    NSString *className = NSStringFromClass(candidate);
+    if (className.length == 0) return NO;
+    if (!sHookedClasses) sHookedClasses = [NSMutableSet set];
+
+    @synchronized (sHookedClasses) {
+        if ([sHookedClasses containsObject:className]) return NO;
+
+        Method method = class_getInstanceMethod(candidate, selector);
+        if (!method) return NO;
+
+        __block IMP originalIMP = method_getImplementation(method);
+        IMP replacementIMP = imp_implementationWithBlock(^void(id object, CMSampleBufferRef sampleBuffer) {
+            IMP next = originalIMP;
+            if (!next) return;
+
+            BOOL isOutermostCall = (sVCamHookRecursionDepth == 0);
+            if (isOutermostCall) {
+                sVCamHookRecursionDepth++;
+                @try {
+                    VCamProcessCameraSampleBuffer(object, sampleBuffer);
+                    ((void (*)(id, SEL, CMSampleBufferRef))next)(object, selector, sampleBuffer);
+                } @finally {
+                    sVCamHookRecursionDepth--;
+                }
+            } else {
+                // A hooked subclass called super. Skip a second render, but
+                // forward to this class's captured original implementation.
+                ((void (*)(id, SEL, CMSampleBufferRef))next)(object, selector, sampleBuffer);
+            }
+        });
+
+        IMP substrateOriginal = NULL;
+        MSHookMessageEx(candidate, selector, replacementIMP, &substrateOriginal);
+        if (!substrateOriginal) {
+            imp_removeBlock(replacementIMP);
+            return NO;
+        }
+
+        originalIMP = substrateOriginal;
+        [sHookedClasses addObject:className];
+        NSLog(@"[VCam] installed class-specific BWNodeOutput trampoline: %@ original=%p",
+              className, substrateOriginal);
+        return YES;
+    }
+}
+
+static void VCamTryInstallCaptureHook(void);
+
+static void VCamScheduleNextHookScan(void) {
+    if (sVCamHookScanScheduled) return;
+    sVCamHookScanScheduled = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        sVCamHookScanScheduled = NO;
+        VCamTryInstallCaptureHook();
+    });
+}
+
+static void VCamTryInstallCaptureHook(void) {
+    sVCamHookAttempts++;
+
+    if (!sCMCaptureHandle) {
+        sCMCaptureHandle = dlopen("/System/Library/PrivateFrameworks/CMCapture.framework/CMCapture", RTLD_NOW | RTLD_GLOBAL);
+        if (!sCMCaptureHandle) {
+            sCMCaptureHandle = dlopen("/System/Library/PrivateFrameworks/CMCapture.framework", RTLD_NOW | RTLD_GLOBAL);
+        }
+    }
+
+    Class baseClass = objc_getClass("BWNodeOutput");
+    SEL selector = sel_registerName("emitSampleBuffer:");
+    Method baseMethod = baseClass ? class_getInstanceMethod(baseClass, selector) : NULL;
+    if (!baseClass || !baseMethod) {
+        VCamSetRuntimeStatus(@"hookState", baseClass ? @"selector-not-found" : @"class-not-found");
+        VCamSetRuntimeStatus(@"hookAttempts", @(sVCamHookAttempts));
+        VCamScheduleNextHookScan();
         return;
     }
 
-    sVCamHookRecursionDepth++;
-    @try {
-        unsigned int mediaType = ((unsigned int (*)(id, SEL))objc_msgSend)(self, sel_registerName("mediaType"));
-        if (mediaType == 'vide') {
-            CVPixelBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-            if (imageBuffer) {
-                uint64_t frameCount = __atomic_add_fetch(&sVCamHookFrameCount, 1, __ATOMIC_RELAXED);
-                if (frameCount == 1) {
-                    NSString *dimensions = [NSString stringWithFormat:@"%zux%zu",
-                        CVPixelBufferGetWidth(imageBuffer), CVPixelBufferGetHeight(imageBuffer)];
-                    VCamSetRuntimeStatus(@"cameraFramesSeen", @YES);
-                    VCamSetRuntimeStatus(@"firstCameraFrameAt", [NSDate date]);
-                    VCamSetRuntimeStatus(@"cameraFrameSize", dimensions);
-                    NSLog(@"[VCam] first video frame reached %@ (%@)", NSStringFromClass(object_getClass(self)), dimensions);
-                }
-                if (frameCount == 1 || (frameCount % 30) == 0) {
-                    VCamSetRuntimeStatus(@"cameraHookFrameCount", @(frameCount));
-                    VCamSetRuntimeStatus(@"cameraHookLastFrameAt", [NSDate date]);
-                }
-
-                @autoreleasepool {
-                    loadReplacementMedia();
-                    // CIContext can write through the GPU/IOSurface path.
-                    // Do not CPU-lock a camera-owned buffer before CIContext renders into it.
-                    @try {
-                        drawReplacementOntoBuffer(imageBuffer);
-                    } @catch (NSException *exception) {
-                        VCamSetRuntimeStatus(@"renderError", exception.reason ?: @"Unknown render exception");
-                        NSLog(@"[VCam] Failed to render replacement media: %@", exception);
-                    }
-                }
-            }
-        }
-        // Keep the recursion guard active while forwarding. A subclass IMP
-        // may call super, which would otherwise process the same frame twice.
-        if (original) ((void (*)(id, SEL, CMSampleBufferRef))original)(self, _cmd, sampleBuffer);
-    } @catch (NSException *exception) {
-        VCamSetRuntimeStatus(@"hookError", exception.reason ?: @"Unknown hook exception");
-        NSLog(@"[VCam] camera hook exception: %@", exception);
-    } @finally {
-        sVCamHookRecursionDepth--;
+    int classCount = objc_getClassList(NULL, 0);
+    Class *classes = classCount > 0 ? (Class *)calloc((size_t)classCount, sizeof(Class)) : NULL;
+    if (!classes) {
+        VCamSetRuntimeStatus(@"hookState", @"class-list-unavailable");
+        VCamScheduleNextHookScan();
+        return;
     }
+    classCount = objc_getClassList(classes, classCount);
+
+    NSUInteger newlyInstalled = 0;
+    // Hook the base class AND all loaded subclasses that directly override
+    // emitSampleBuffer:. Per-class trampolines make super-calls safe.
+    for (int i = 0; i < classCount; i++) {
+        Class candidate = classes[i];
+        if (!candidate) continue;
+        if (candidate != baseClass && !VCamClassDescendsFrom(candidate, baseClass)) continue;
+        if (!VCamClassImplementsSelectorDirectly(candidate, selector)) continue;
+        if (VCamInstallCameraMethodHook(candidate, selector)) newlyInstalled++;
+    }
+    free(classes);
+
+    NSUInteger totalHooked = 0;
+    @synchronized (sHookedClasses) { totalHooked = sHookedClasses.count; }
+    sVCamHookInstalled = (totalHooked > 0);
+    VCamSetRuntimeStatus(@"hookState", sVCamHookInstalled ? @"installed-class-specific-hooks" : @"waiting-for-camera-node-implementations");
+    VCamSetRuntimeStatus(@"hookedClassCount", @(totalHooked));
+    VCamSetRuntimeStatus(@"hookInstallPassCount", @(sVCamHookAttempts));
+    VCamSetRuntimeStatus(@"hookAttempts", @(sVCamHookAttempts));
+    if (newlyInstalled > 0) {
+        VCamSetRuntimeStatus(@"hookInstalledAt", [NSDate date]);
+        NSLog(@"[VCam] scan %lu: %lu class hook(s) installed; %lu total",
+              (unsigned long)sVCamHookAttempts, (unsigned long)newlyInstalled, (unsigned long)totalHooked);
+    }
+
+    // The graph can load output-node classes lazily after daemon startup.
+    // Continue scanning after an initial install instead of declaring success.
+    VCamScheduleNextHookScan();
 }
 
 // -----------------------------------------------------------------------------
