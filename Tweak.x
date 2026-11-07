@@ -74,14 +74,15 @@ static void VCamEmitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuff
                 }
             }
         }
+        // Keep the recursion guard active while forwarding. A subclass IMP
+        // may call super, which would otherwise process the same frame twice.
+        if (original) ((void (*)(id, SEL, CMSampleBufferRef))original)(self, _cmd, sampleBuffer);
     } @catch (NSException *exception) {
         VCamSetRuntimeStatus(@"hookError", exception.reason ?: @"Unknown hook exception");
         NSLog(@"[VCam] camera hook exception: %@", exception);
     } @finally {
         sVCamHookRecursionDepth--;
     }
-
-    if (original) ((void (*)(id, SEL, CMSampleBufferRef))original)(self, _cmd, sampleBuffer);
 }
 
 static BOOL VCamClassIsBWNodeOutputSubclass(Class candidate, Class baseClass) {
