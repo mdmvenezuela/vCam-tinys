@@ -391,6 +391,9 @@ NSDictionary *VCamCopyRuntimeStatus(void) {
         }
         if ([processName isEqualToString:@"mediaserverd"]) {
             uint64_t counter = 0;
+            if (VCamTryReadRuntimeCounter(@"cameraEmitCallbackCount", &counter)) {
+                status[@"cameraEmitCallbackCount"] = @(counter);
+            }
             if (VCamTryReadRuntimeCounter(@"cameraHookFrameCount", &counter)) {
                 status[@"cameraHookFrameCount"] = @(counter);
             }
@@ -431,7 +434,7 @@ void VCamSetRuntimeStatus(NSString *key, id value) {
         // fast-path. The plist can be stale or absent across RootHide views;
         // returning early here previously left a stale "media-not-ready"
         // reason in the shared notify state even after the render path cleared it.
-        if ([key isEqualToString:@"cameraHookFrameCount"] || [key isEqualToString:@"replacementRenderCount"]) {
+        if ([key isEqualToString:@"cameraEmitCallbackCount"] || [key isEqualToString:@"cameraHookFrameCount"] || [key isEqualToString:@"replacementRenderCount"]) {
             VCamPublishRuntimeCounter(key, value ? [value unsignedLongLongValue] : 0);
         } else if ([key isEqualToString:@"renderSkipReason"]) {
             VCamPublishRuntimeCounter(key, value ? VCamRenderSkipCode([value description]) : 0);
@@ -475,6 +478,7 @@ void VCamResetRuntimeStatus(void) {
     // after 8 seconds in SpringBoard, so a crashed/restarted daemon is detected.
     VCamPublishHeartbeatForProcess(processName);
     if ([processName isEqualToString:@"mediaserverd"]) {
+        VCamPublishRuntimeCounter(@"cameraEmitCallbackCount", 0);
         VCamPublishRuntimeCounter(@"cameraHookFrameCount", 0);
         VCamPublishRuntimeCounter(@"replacementRenderCount", 0);
         VCamPublishRuntimeCounter(@"renderSkipReason", 0);
