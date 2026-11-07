@@ -4,6 +4,10 @@
 <dict>
   <key>Filter</key>
   <dict>
+    <key>Bundles</key>
+    <array>
+      <string>com.apple.UIKit</string>
+    </array>
     <key>Executables</key>
     <array>
       <string>/usr/sbin/mediaserverd</string>

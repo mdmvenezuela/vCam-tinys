@@ -5,6 +5,7 @@
 #import <substrate.h>
 #import <dlfcn.h>
 #import <dispatch/dispatch.h>
+#import <AVFoundation/AVFoundation.h>
 
 // Hook BWNodeOutput and every concrete subclass that overrides
 // emitSampleBuffer:. Some camera graph nodes dispatch through subclass IMPs,
@@ -106,6 +107,154 @@ static BOOL VCamClassImplementsSelectorDirectly(Class cls, SEL selector) {
     return found;
 }
 
+
+
+// -----------------------------------------------------------------------------
+// Per-app AVFoundation fallback, adapted from Five-great/ios-vcam.
+// Hook the actual delegate class registered with AVCaptureVideoDataOutput.
+// This is deliberately separate from the mediaserverd BWNodeOutput path.
+// -----------------------------------------------------------------------------
+
+static void *sAVFoundationHandle = NULL;
+static IMP sOriginalSetSampleBufferDelegate = NULL;
+static NSMutableDictionary<NSString *, NSValue *> *sAppDelegateOriginalIMPs;
+static NSMutableSet<NSString *> *sAppHookedDelegateClasses;
+static BOOL sAppCaptureHookInstalled = NO;
+static NSUInteger sAppCaptureHookAttempts = 0;
+static uint64_t sAppCaptureFrameCount = 0;
+static __thread int sAppCaptureRecursionDepth = 0;
+
+static IMP VCamAppOriginalIMPForObject(id object) {
+    Class cls = object_getClass(object);
+    @synchronized (sAppDelegateOriginalIMPs) {
+        for (Class current = cls; current; current = class_getSuperclass(current)) {
+            NSValue *value = sAppDelegateOriginalIMPs[NSStringFromClass(current)];
+            if (value) return (IMP)value.pointerValue;
+        }
+    }
+    return NULL;
+}
+
+static void VCamAppCaptureOutput(id self, SEL _cmd, AVCaptureOutput *output,
+                                 CMSampleBufferRef sampleBuffer, AVCaptureConnection *connection) {
+    IMP original = VCamAppOriginalIMPForObject(self);
+    if (!original) return;
+    if (!sampleBuffer || sAppCaptureRecursionDepth > 0) {
+        ((void (*)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *))original)
+            (self, _cmd, output, sampleBuffer, connection);
+        return;
+    }
+
+    sAppCaptureRecursionDepth++;
+    @try {
+        CVPixelBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+        if (imageBuffer) {
+            uint64_t count = __atomic_add_fetch(&sAppCaptureFrameCount, 1, __ATOMIC_RELAXED);
+            if (count == 1) {
+                NSLog(@"[VCam] AVFoundation delegate path ACTIVE in %@ (%zux%zu)",
+                      NSProcessInfo.processInfo.processName,
+                      CVPixelBufferGetWidth(imageBuffer), CVPixelBufferGetHeight(imageBuffer));
+            }
+            @autoreleasepool {
+                loadReplacementMedia();
+                CVReturn lockResult = CVPixelBufferLockBaseAddress(imageBuffer, 0);
+                if (lockResult == kCVReturnSuccess) {
+                    @try {
+                        drawReplacementOntoBuffer(imageBuffer);
+                    } @catch (NSException *exception) {
+                        NSLog(@"[VCam] app delegate render exception: %@", exception);
+                    } @finally {
+                        CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
+                    }
+                } else if (count == 1) {
+                    NSLog(@"[VCam] app delegate pixel buffer lock failed: %d", lockResult);
+                }
+            }
+        }
+    } @catch (NSException *exception) {
+        NSLog(@"[VCam] app capture callback exception: %@", exception);
+    } @finally {
+        sAppCaptureRecursionDepth--;
+    }
+
+    ((void (*)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *))original)
+        (self, _cmd, output, sampleBuffer, connection);
+}
+
+static void VCamHookAppDelegate(id delegate) {
+    if (!delegate) return;
+    SEL callback = sel_registerName("captureOutput:didOutputSampleBuffer:fromConnection:");
+    Class delegateClass = object_getClass(delegate);
+    Class implementationClass = Nil;
+
+    // Hook the first class in the delegate's inheritance chain that owns the
+    // callback. This catches concrete app delegates instead of only NSObject.
+    for (Class current = delegateClass; current; current = class_getSuperclass(current)) {
+        if (VCamClassImplementsSelectorDirectly(current, callback)) {
+            implementationClass = current;
+            break;
+        }
+    }
+    if (!implementationClass) return;
+
+    NSString *className = NSStringFromClass(implementationClass);
+    if (!sAppDelegateOriginalIMPs) sAppDelegateOriginalIMPs = [NSMutableDictionary dictionary];
+    if (!sAppHookedDelegateClasses) sAppHookedDelegateClasses = [NSMutableSet set];
+    @synchronized (sAppHookedDelegateClasses) {
+        if ([sAppHookedDelegateClasses containsObject:className]) return;
+        IMP original = NULL;
+        MSHookMessageEx(implementationClass, callback, (IMP)VCamAppCaptureOutput, &original);
+        if (original) {
+            sAppDelegateOriginalIMPs[className] = [NSValue valueWithPointer:original];
+            [sAppHookedDelegateClasses addObject:className];
+            NSLog(@"[VCam] hooked AVCapture delegate class %@", className);
+        }
+    }
+}
+
+static void VCamSetSampleBufferDelegate(id self, SEL _cmd,
+                                        id<AVCaptureVideoDataOutputSampleBufferDelegate> delegate,
+                                        dispatch_queue_t queue) {
+    if (sOriginalSetSampleBufferDelegate) {
+        ((void (*)(id, SEL, id, dispatch_queue_t))sOriginalSetSampleBufferDelegate)(self, _cmd, delegate, queue);
+    }
+    if (delegate) VCamHookAppDelegate(delegate);
+}
+
+static void VCamTryInstallAppCaptureHooks(void) {
+    if (sAppCaptureHookInstalled) return;
+    sAppCaptureHookAttempts++;
+
+    if (!sAVFoundationHandle) {
+        sAVFoundationHandle = dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation",
+                                     RTLD_NOW | RTLD_GLOBAL);
+    }
+
+    Class outputClass = objc_getClass("AVCaptureVideoDataOutput");
+    SEL setter = sel_registerName("setSampleBufferDelegate:queue:");
+    Method method = outputClass ? class_getInstanceMethod(outputClass, setter) : NULL;
+    if (method) {
+        MSHookMessageEx(outputClass, setter, (IMP)VCamSetSampleBufferDelegate,
+                        &sOriginalSetSampleBufferDelegate);
+        sAppCaptureHookInstalled = (sOriginalSetSampleBufferDelegate != NULL);
+        if (sAppCaptureHookInstalled) {
+            NSLog(@"[VCam] AVFoundation app-level capture hook installed in %@",
+                  NSProcessInfo.processInfo.processName);
+            return;
+        }
+    }
+
+    if (sAppCaptureHookAttempts < 30) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            VCamTryInstallAppCaptureHooks();
+        });
+    } else {
+        NSLog(@"[VCam] AVFoundation app-level hook unavailable in %@ (class=%@)",
+              NSProcessInfo.processInfo.processName, outputClass ? @"present" : @"missing");
+    }
+}
+
 static void VCamTryInstallCaptureHook(void) {
     if (sVCamHookInstalled) return;
     sVCamHookAttempts++;
@@ -180,9 +329,14 @@ static void VCamTryInstallCaptureHook(void) {
 
 %ctor {
     @autoreleasepool {
-        VCamResetRuntimeStatus();
-        NSString *processName = NSProcessInfo.processInfo.processName;
-        NSLog(@"[VCam] camera daemon tweak loaded in %@; scanning BWNodeOutput implementations", processName);
-        VCamTryInstallCaptureHook();
+        NSString *processName = NSProcessInfo.processInfo.processName.lowercaseString;
+        if ([processName isEqualToString:@"mediaserverd"]) {
+            VCamResetRuntimeStatus();
+            NSLog(@"[VCam] camera daemon tweak loaded; scanning BWNodeOutput implementations");
+            VCamTryInstallCaptureHook();
+        } else if (![processName isEqualToString:@"springboard"]) {
+            NSLog(@"[VCam] app-level camera injection loaded in %@", processName);
+            VCamTryInstallAppCaptureHooks();
+        }
     }
 }
