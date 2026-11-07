@@ -13,7 +13,7 @@ NSString * const VCamOffsetYKey = @"OffsetY";
 NSString * const VCamRotationKey = @"Rotation";
 NSString * const VCamZoomKey = @"Zoom";
 NSString * const VCamVideoPausedKey = @"VideoPaused";
-NSString * const VCamRuntimeVersion = @"0.1.42";
+NSString * const VCamRuntimeVersion = @"0.1.43";
 
 static NSString *VCamPreferencesDirectory(void) {
     // Keep persistent preferences outside /tmp; only the selected media is temporary.
@@ -339,11 +339,12 @@ static void VCamPublishRuntimeCounter(NSString *key, uint64_t value) {
     notify_post(VCamRuntimeNotifyName(key).UTF8String);
 }
 
-static uint64_t VCamReadRuntimeCounter(NSString *key) {
+static BOOL VCamTryReadRuntimeCounter(NSString *key, uint64_t *valueOut) {
     int token = VCamNotifyTokenForName(VCamRuntimeNotifyName(key));
     uint64_t value = 0;
-    if (token == NOTIFY_TOKEN_INVALID || notify_get_state(token, &value) != NOTIFY_STATUS_OK) return 0;
-    return value;
+    if (token == NOTIFY_TOKEN_INVALID || notify_get_state(token, &value) != NOTIFY_STATUS_OK) return NO;
+    if (valueOut) *valueOut = value;
+    return YES;
 }
 
 static uint64_t VCamRenderSkipCode(NSString *reason) {
@@ -389,11 +390,18 @@ NSDictionary *VCamCopyRuntimeStatus(void) {
             status[@"daemonPID"] = @0; // heartbeat proves the injected runtime is alive; PID may be sandbox-hidden.
         }
         if ([processName isEqualToString:@"mediaserverd"]) {
-            status[@"cameraHookFrameCount"] = @(VCamReadRuntimeCounter(@"cameraHookFrameCount"));
-            status[@"replacementRenderCount"] = @(VCamReadRuntimeCounter(@"replacementRenderCount"));
-            NSString *skipReason = VCamRenderSkipReasonForCode(VCamReadRuntimeCounter(@"renderSkipReason"));
-            if (skipReason) status[@"renderSkipReason"] = skipReason;
-            else [status removeObjectForKey:@"renderSkipReason"];
+            uint64_t counter = 0;
+            if (VCamTryReadRuntimeCounter(@"cameraHookFrameCount", &counter)) {
+                status[@"cameraHookFrameCount"] = @(counter);
+            }
+            if (VCamTryReadRuntimeCounter(@"replacementRenderCount", &counter)) {
+                status[@"replacementRenderCount"] = @(counter);
+            }
+            if (VCamTryReadRuntimeCounter(@"renderSkipReason", &counter)) {
+                NSString *skipReason = VCamRenderSkipReasonForCode(counter);
+                if (skipReason) status[@"renderSkipReason"] = skipReason;
+                else [status removeObjectForKey:@"renderSkipReason"];
+            }
         }
         daemonStatuses[processName] = [status copy];
 
