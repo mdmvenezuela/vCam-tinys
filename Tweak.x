@@ -173,8 +173,14 @@ static void VCamProcessSinkSampleBuffer(id input,
     }
 
     if (count == 1 || (count % 30) == 0) {
+        NSDate *now = [NSDate date];
         VCamSetRuntimeStatus(counterKey, @(count));
-        VCamSetRuntimeStatus(@"cameraSinkLastFrameAt", [NSDate date]);
+        VCamSetRuntimeStatus(@"cameraSinkLastFrameAt", now);
+        if ([counterKey isEqualToString:@"cameraLocalPreviewSinkCount"]) {
+            VCamSetRuntimeStatus(@"cameraLocalPreviewSinkLastFrameAt", now);
+        } else if ([counterKey isEqualToString:@"cameraRemotePreviewSinkCount"]) {
+            VCamSetRuntimeStatus(@"cameraRemotePreviewSinkLastFrameAt", now);
+        }
         VCamSetRuntimeStatus(@"cameraFrameSize",
             [NSString stringWithFormat:@"%zux%zu",
              CVPixelBufferGetWidth(imageBuffer), CVPixelBufferGetHeight(imageBuffer)]);
