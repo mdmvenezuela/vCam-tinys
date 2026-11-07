@@ -1,6 +1,6 @@
 Package: com.tinysweet.vcamios
 Name: VCam iOS
-Version: 0.1.43
+Version: 0.1.44
 Architecture: iphoneos-arm64
 Description: Virtual camera replacement with a floating media control menu.
 Maintainer: tinysweet
