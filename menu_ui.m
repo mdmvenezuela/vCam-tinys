@@ -665,10 +665,27 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         ? [runtime[@"cameraEmitCallbackCount"] unsignedLongLongValue] : 0;
     uint64_t hookFrameCount = [runtime[@"cameraHookFrameCount"] respondsToSelector:@selector(unsignedLongLongValue)]
         ? [runtime[@"cameraHookFrameCount"] unsignedLongLongValue] : 0;
+    uint64_t localSinkCount = [runtime[@"cameraLocalPreviewSinkCount"] respondsToSelector:@selector(unsignedLongLongValue)]
+        ? [runtime[@"cameraLocalPreviewSinkCount"] unsignedLongLongValue] : 0;
+    uint64_t remoteSinkCount = [runtime[@"cameraRemotePreviewSinkCount"] respondsToSelector:@selector(unsignedLongLongValue)]
+        ? [runtime[@"cameraRemotePreviewSinkCount"] unsignedLongLongValue] : 0;
+    uint64_t stillSinkCount = [runtime[@"cameraStillPhotoSinkCount"] respondsToSelector:@selector(unsignedLongLongValue)]
+        ? [runtime[@"cameraStillPhotoSinkCount"] unsignedLongLongValue] : 0;
     uint64_t renderCount = [runtime[@"replacementRenderCount"] respondsToSelector:@selector(unsignedLongLongValue)]
         ? [runtime[@"replacementRenderCount"] unsignedLongLongValue] : 0;
-    BOOL framesSeen = hookFrameCount > 0;
+    BOOL previewSinkFramesSeen = (localSinkCount + remoteSinkCount) > 0;
+    BOOL framesSeen = hookFrameCount > 0 || previewSinkFramesSeen;
     BOOL rendered = renderCount > 0;
+    NSString *localSinkHookState = [runtime[@"localPreviewSinkHookState"] isKindOfClass:NSString.class]
+        ? [runtime[@"localPreviewSinkHookState"] uppercaseString] : @"WAITING";
+    NSString *remoteSinkHookState = [runtime[@"remotePreviewSinkHookState"] isKindOfClass:NSString.class]
+        ? [runtime[@"remotePreviewSinkHookState"] uppercaseString] : @"WAITING";
+    NSString *stillSinkHookState = [runtime[@"stillPhotoSinkHookState"] isKindOfClass:NSString.class]
+        ? [runtime[@"stillPhotoSinkHookState"] uppercaseString] : @"WAITING";
+    NSDate *localSinkLastFrameAt = [runtime[@"cameraLocalPreviewSinkLastFrameAt"] isKindOfClass:NSDate.class]
+        ? runtime[@"cameraLocalPreviewSinkLastFrameAt"] : nil;
+    NSTimeInterval localSinkAge = localSinkLastFrameAt
+        ? MAX(0.0, [[NSDate date] timeIntervalSinceDate:localSinkLastFrameAt]) : -1.0;
     NSString *mediaState = [runtime[@"mediaState"] isKindOfClass:[NSString class]] ? runtime[@"mediaState"] : @"not-checked";
     NSString *mediaDetail = [runtime[@"mediaDetail"] isKindOfClass:[NSString class]] ? runtime[@"mediaDetail"] : @"";
     NSString *hookDetail = [runtime[@"hookDetail"] isKindOfClass:[NSString class]] ? runtime[@"hookDetail"] : @"";
@@ -681,7 +698,10 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         ? [NSString stringWithFormat:@"Camera frames: RECEIVED (%@)", runtime[@"cameraFrameSize"] ?: @"size unknown"]
         : (emitCallbackCount > 0
             ? @"Camera frames: callback reached, but no video pixel buffers were accepted"
-            : @"Camera frames: NOT INTERCEPTED (emitSampleBuffer callback count is zero)");
+            : @"Camera frames: NOT INTERCEPTED (source and preview sink callbacks are zero)");
+    NSString *localSinkAgeLine = localSinkAge >= 0.0
+        ? [NSString stringWithFormat:@"Local preview last frame: %.1fs ago", localSinkAge]
+        : @"Local preview last frame: NOT RECEIVED";
     NSString *mediaLine = [NSString stringWithFormat:@"Media: %@%@", mediaState.uppercaseString, mediaDetail.length ? [@" — " stringByAppendingString:mediaDetail] : @""];
     NSString *enabledLine = [runtime[@"replacementEnabled"] respondsToSelector:@selector(boolValue)]
         ? [NSString stringWithFormat:@"Replacement state (mediaserverd): %@", [runtime[@"replacementEnabled"] boolValue] ? @"ON" : @"OFF"]
@@ -714,9 +734,16 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         outputLine,
         [NSString stringWithFormat:@"emitSampleBuffer callbacks: %llu", (unsigned long long)emitCallbackCount],
         [NSString stringWithFormat:@"Hook video frames observed: %llu", (unsigned long long)hookFrameCount],
+        [NSString stringWithFormat:@"Local preview sink hook: %@", localSinkHookState],
+        [NSString stringWithFormat:@"Local preview sink frames: %llu", (unsigned long long)localSinkCount],
+        localSinkAgeLine,
+        [NSString stringWithFormat:@"Remote preview sink hook: %@", remoteSinkHookState],
+        [NSString stringWithFormat:@"Remote preview sink frames: %llu", (unsigned long long)remoteSinkCount],
+        [NSString stringWithFormat:@"Still photo sink hook: %@", stillSinkHookState],
+        [NSString stringWithFormat:@"Still photo sink pixel buffers: %llu", (unsigned long long)stillSinkCount],
         [NSString stringWithFormat:@"Replacement renders completed: %llu", (unsigned long long)renderCount],
         [NSString stringWithFormat:@"Last render size: %@", runtime[@"replacementRenderLastSize"] ?: @"not recorded"],
-        [NSString stringWithFormat:@"Render skip reason: %@", runtime[@"renderSkipReason"] ?: (renderCount > 0 ? @"none — render completed" : (hookFrameCount > 0 ? @"no render completed" : (emitCallbackCount > 0 ? @"no video frame accepted" : @"emitSampleBuffer callback not reached"))) ],
+        [NSString stringWithFormat:@"Render skip reason: %@", runtime[@"renderSkipReason"] ?: (renderCount > 0 ? @"none — render completed" : (framesSeen ? @"sink frames reached without completed render" : (emitCallbackCount > 0 ? @"no video frame accepted" : @"source/sink callbacks not reached"))) ],
         @"Camera coverage: front and rear live preview streams"
     ]];
     if (hookDetail.length) [lines addObject:[@"Hook detail: " stringByAppendingString:hookDetail]];
@@ -730,8 +757,8 @@ static UILabel *VCamMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [lines addObject:@"Action: enable Tweak Injection in Relaxin and run a Userspace Reboot."];
     } else if (![hookState hasPrefix:@"installed"]) {
         [lines addObject:@"Action: the camera hook is not installed. Check Hook detail."];
-    } else if (emitCallbackCount == 0) {
-        [lines addObject:@"Action: mediaserverd is alive, but BWNodeOutput emitSampleBuffer has not been intercepted. The camera delivery path is still outside this hook."];
+    } else if (emitCallbackCount == 0 && !previewSinkFramesSeen) {
+        [lines addObject:@"Action: neither BWNodeOutput nor the final preview sinks have delivered a video frame to the replacement hooks."];
     } else if (!framesSeen) {
         [lines addObject:@"Action: emitSampleBuffer is being called, but it is not delivering a video pixel buffer accepted by this hook."];
     } else if ([mediaState isEqualToString:@"disabled"]) {
