@@ -13,7 +13,7 @@ NSString * const VCamOffsetYKey = @"OffsetY";
 NSString * const VCamRotationKey = @"Rotation";
 NSString * const VCamZoomKey = @"Zoom";
 NSString * const VCamVideoPausedKey = @"VideoPaused";
-NSString * const VCamRuntimeVersion = @"0.1.41";
+NSString * const VCamRuntimeVersion = @"0.1.42";
 
 static NSString *VCamPreferencesDirectory(void) {
     // Keep persistent preferences outside /tmp; only the selected media is temporary.
@@ -418,16 +418,21 @@ void VCamSetRuntimeStatus(NSString *key, id value) {
         if (!status) status = [NSMutableDictionary dictionary];
         status[@"daemonProcess"] = processName;
         id oldValue = status[key];
-        if (value && [oldValue isEqual:value]) return;
-        if (!value && !oldValue) return;
-        if (value) status[key] = value;
-        else [status removeObjectForKey:key];
 
+        // Publish notify-backed counters/reason before the plist equality
+        // fast-path. The plist can be stale or absent across RootHide views;
+        // returning early here previously left a stale "media-not-ready"
+        // reason in the shared notify state even after the render path cleared it.
         if ([key isEqualToString:@"cameraHookFrameCount"] || [key isEqualToString:@"replacementRenderCount"]) {
             VCamPublishRuntimeCounter(key, value ? [value unsignedLongLongValue] : 0);
         } else if ([key isEqualToString:@"renderSkipReason"]) {
             VCamPublishRuntimeCounter(key, value ? VCamRenderSkipCode([value description]) : 0);
         }
+
+        if (value && [oldValue isEqual:value]) return;
+        if (!value && !oldValue) return;
+        if (value) status[key] = value;
+        else [status removeObjectForKey:key];
 
         if (!VCamEnsureRuntimeStatusDirectory()) return;
         BOOL didWrite = [status writeToFile:path atomically:YES];
