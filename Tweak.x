@@ -43,6 +43,43 @@ static BOOL VCamClassDescendsFrom(Class candidate, Class ancestor) {
     return NO;
 }
 
+static void VCamDrawReplacementOnce(CMSampleBufferRef sampleBuffer, CVPixelBufferRef imageBuffer) {
+    if (!sampleBuffer || !imageBuffer) return;
+
+    // The same frame can traverse BWNodeOutput and then one or more sink nodes.
+    // Tag its pixel buffer by presentation timestamp so the final sink can act
+    // as a fallback after graph reconfiguration without rendering the same
+    // camera frame twice.
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    NSString *frameMarker = nil;
+    if (CMTIME_IS_VALID(pts) && CMTIME_IS_NUMERIC(pts) && pts.timescale > 0) {
+        frameMarker = [NSString stringWithFormat:@"%lld/%d/%lld",
+                       pts.value, pts.timescale, pts.epoch];
+        CFTypeRef previousMarker = CVBufferGetAttachment(
+            imageBuffer, CFSTR("com.mdmvenezuela.vcam.rendered-pts"), NULL);
+        if (previousMarker && CFEqual(previousMarker, (__bridge CFStringRef)frameMarker)) {
+            return;
+        }
+    }
+
+    @autoreleasepool {
+        loadReplacementMedia();
+        @try {
+            drawReplacementOntoBuffer(imageBuffer);
+        } @catch (NSException *exception) {
+            VCamSetRuntimeStatus(@"renderError", exception.reason ?: @"Unknown render exception");
+            NSLog(@"[VCam] Failed to render replacement media: %@", exception);
+        }
+    }
+
+    if (frameMarker) {
+        CVBufferSetAttachment(imageBuffer,
+                              CFSTR("com.mdmvenezuela.vcam.rendered-pts"),
+                              (__bridge CFStringRef)frameMarker,
+                              kCVAttachmentMode_ShouldNotPropagate);
+    }
+}
+
 static void VCamProcessCameraSampleBuffer(id output, CMSampleBufferRef sampleBuffer) {
     if (!sampleBuffer) return;
 
@@ -82,16 +119,151 @@ static void VCamProcessCameraSampleBuffer(id output, CMSampleBufferRef sampleBuf
         VCamSetRuntimeStatus(@"cameraHookLastFrameAt", [NSDate date]);
     }
 
-    @autoreleasepool {
-        loadReplacementMedia();
+    VCamDrawReplacementOnce(sampleBuffer, imageBuffer);
+}
+
+// Final camera sinks receive the exact buffers that are about to be displayed
+// locally or sent to an AVCapture client. These hooks remain active when the
+// still-photo shutter rebuilds/reconfigures the graph and a source output node
+// changes underneath BWNodeOutput.
+static IMP sOriginalImageQueueSinkRender = NULL;
+static IMP sOriginalRemoteQueueSinkRender = NULL;
+static IMP sOriginalStillImageSinkRender = NULL;
+static BOOL sImageQueueSinkHookInstalled = NO;
+static BOOL sRemoteQueueSinkHookInstalled = NO;
+static BOOL sStillImageSinkHookInstalled = NO;
+static uint64_t sLocalPreviewSinkFrameCount = 0;
+static uint64_t sRemotePreviewSinkFrameCount = 0;
+static uint64_t sStillPhotoSinkFrameCount = 0;
+
+static void VCamProcessSinkSampleBuffer(id input,
+                                        CMSampleBufferRef sampleBuffer,
+                                        BOOL requireVideoMediaType,
+                                        NSString *counterKey) {
+    if (!sampleBuffer) return;
+
+    if (requireVideoMediaType) {
+        if (!input) return;
+        unsigned int mediaType = 0;
         @try {
-            drawReplacementOntoBuffer(imageBuffer);
+            mediaType = ((unsigned int (*)(id, SEL))objc_msgSend)(input, sel_registerName("mediaType"));
         } @catch (NSException *exception) {
-            VCamSetRuntimeStatus(@"renderError", exception.reason ?: @"Unknown render exception");
-            NSLog(@"[VCam] Failed to render replacement media: %@", exception);
+            VCamSetRuntimeStatus(@"sinkHookError", exception.reason ?: @"Unable to read sink input mediaType");
+            return;
         }
+        if (mediaType != 'vide') return;
+    }
+
+    CVPixelBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (!imageBuffer) {
+        if (!requireVideoMediaType) {
+            VCamSetRuntimeStatus(@"stillPhotoSinkBufferHasPixelBuffer", @NO);
+        }
+        return;
+    }
+
+    uint64_t count = 0;
+    if ([counterKey isEqualToString:@"cameraLocalPreviewSinkCount"]) {
+        count = __atomic_add_fetch(&sLocalPreviewSinkFrameCount, 1, __ATOMIC_RELAXED);
+    } else if ([counterKey isEqualToString:@"cameraRemotePreviewSinkCount"]) {
+        count = __atomic_add_fetch(&sRemotePreviewSinkFrameCount, 1, __ATOMIC_RELAXED);
+    } else {
+        count = __atomic_add_fetch(&sStillPhotoSinkFrameCount, 1, __ATOMIC_RELAXED);
+        VCamSetRuntimeStatus(@"stillPhotoSinkBufferHasPixelBuffer", @YES);
+    }
+
+    if (count == 1 || (count % 30) == 0) {
+        VCamSetRuntimeStatus(counterKey, @(count));
+        VCamSetRuntimeStatus(@"cameraSinkLastFrameAt", [NSDate date]);
+        VCamSetRuntimeStatus(@"cameraFrameSize",
+            [NSString stringWithFormat:@"%zux%zu",
+             CVPixelBufferGetWidth(imageBuffer), CVPixelBufferGetHeight(imageBuffer)]);
+        VCamSetRuntimeStatus(@"cameraFramesSeen", @YES);
+    }
+
+    VCamDrawReplacementOnce(sampleBuffer, imageBuffer);
+}
+
+static void VCamImageQueueSinkRender(id self, SEL _cmd,
+                                     CMSampleBufferRef sampleBuffer, id input) {
+    VCamProcessSinkSampleBuffer(input, sampleBuffer, YES, @"cameraLocalPreviewSinkCount");
+    if (sOriginalImageQueueSinkRender) {
+        ((void (*)(id, SEL, CMSampleBufferRef, id))sOriginalImageQueueSinkRender)
+            (self, _cmd, sampleBuffer, input);
     }
 }
+
+static void VCamRemoteQueueSinkRender(id self, SEL _cmd,
+                                      CMSampleBufferRef sampleBuffer, id input) {
+    VCamProcessSinkSampleBuffer(input, sampleBuffer, YES, @"cameraRemotePreviewSinkCount");
+    if (sOriginalRemoteQueueSinkRender) {
+        ((void (*)(id, SEL, CMSampleBufferRef, id))sOriginalRemoteQueueSinkRender)
+            (self, _cmd, sampleBuffer, input);
+    }
+}
+
+static void VCamStillImageSinkRender(id self, SEL _cmd,
+                                     CMSampleBufferRef sampleBuffer, id input) {
+    // The still sink may receive either a pixel-buffer photo or a compressed
+    // sample buffer. Only mutate the former; compressed JPEG/HEIF samples are
+    // left untouched rather than being treated as camera preview buffers.
+    VCamProcessSinkSampleBuffer(input, sampleBuffer, NO, @"cameraStillPhotoSinkCount");
+    if (sOriginalStillImageSinkRender) {
+        ((void (*)(id, SEL, CMSampleBufferRef, id))sOriginalStillImageSinkRender)
+            (self, _cmd, sampleBuffer, input);
+    }
+}
+
+static void VCamTryInstallSinkHooks(void) {
+    SEL renderSelector = sel_registerName("renderSampleBuffer:forInput:");
+
+    Class localSinkClass = objc_getClass("BWImageQueueSinkNode");
+    if (localSinkClass && !sImageQueueSinkHookInstalled &&
+        VCamClassImplementsSelectorDirectly(localSinkClass, renderSelector)) {
+        IMP original = NULL;
+        MSHookMessageEx(localSinkClass, renderSelector, (IMP)VCamImageQueueSinkRender, &original);
+        if (original) {
+            sOriginalImageQueueSinkRender = original;
+            sImageQueueSinkHookInstalled = YES;
+            VCamSetRuntimeStatus(@"localPreviewSinkHookState", @"installed");
+            NSLog(@"[VCam] installed final local preview sink hook");
+        }
+    }
+
+    Class remoteSinkClass = objc_getClass("BWRemoteQueueSinkNode");
+    if (remoteSinkClass && !sRemoteQueueSinkHookInstalled &&
+        VCamClassImplementsSelectorDirectly(remoteSinkClass, renderSelector)) {
+        IMP original = NULL;
+        MSHookMessageEx(remoteSinkClass, renderSelector, (IMP)VCamRemoteQueueSinkRender, &original);
+        if (original) {
+            sOriginalRemoteQueueSinkRender = original;
+            sRemoteQueueSinkHookInstalled = YES;
+            VCamSetRuntimeStatus(@"remotePreviewSinkHookState", @"installed");
+            NSLog(@"[VCam] installed final remote preview sink hook");
+        }
+    }
+
+    Class stillSinkClass = objc_getClass("BWStillImageSampleBufferSinkNode");
+    if (stillSinkClass && !sStillImageSinkHookInstalled &&
+        VCamClassImplementsSelectorDirectly(stillSinkClass, renderSelector)) {
+        IMP original = NULL;
+        MSHookMessageEx(stillSinkClass, renderSelector, (IMP)VCamStillImageSinkRender, &original);
+        if (original) {
+            sOriginalStillImageSinkRender = original;
+            sStillImageSinkHookInstalled = YES;
+            VCamSetRuntimeStatus(@"stillPhotoSinkHookState", @"installed");
+            NSLog(@"[VCam] installed final still-photo sink hook");
+        }
+    }
+
+    VCamSetRuntimeStatus(@"localPreviewSinkHookState",
+        sImageQueueSinkHookInstalled ? @"installed" : (localSinkClass ? @"method-not-found" : @"class-not-found"));
+    VCamSetRuntimeStatus(@"remotePreviewSinkHookState",
+        sRemoteQueueSinkHookInstalled ? @"installed" : (remoteSinkClass ? @"method-not-found" : @"class-not-found"));
+    VCamSetRuntimeStatus(@"stillPhotoSinkHookState",
+        sStillImageSinkHookInstalled ? @"installed" : (stillSinkClass ? @"method-not-found" : @"class-not-found"));
+}
+
 
 static BOOL VCamInstallCameraMethodHook(Class candidate, SEL selector) {
     NSString *className = NSStringFromClass(candidate);
@@ -163,6 +335,10 @@ static void VCamTryInstallCaptureHook(void) {
             sCMCaptureHandle = dlopen("/System/Library/PrivateFrameworks/CMCapture.framework", RTLD_NOW | RTLD_GLOBAL);
         }
     }
+
+    // Install sink-side hooks independently of BWNodeOutput. The sink classes
+    // can exist even when the source callback implementation is unavailable.
+    VCamTryInstallSinkHooks();
 
     Class baseClass = objc_getClass("BWNodeOutput");
     SEL selector = sel_registerName("emitSampleBuffer:");
