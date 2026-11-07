@@ -239,8 +239,20 @@ static void VCamTryInstallAppCaptureHooks(void) {
     }
 }
 
+static BOOL VCamHasOverridingDescendant(Class candidate, Class *classes, int classCount, SEL selector) {
+    for (int i = 0; i < classCount; i++) {
+        Class current = classes[i];
+        if (!current || current == candidate) continue;
+        BOOL isDescendant = NO;
+        for (Class parent = class_getSuperclass(current); parent; parent = class_getSuperclass(parent)) {
+            if (parent == candidate) { isDescendant = YES; break; }
+        }
+        if (isDescendant && VCamClassImplementsSelectorDirectly(current, selector)) return YES;
+    }
+    return NO;
+}
+
 static void VCamTryInstallCaptureHook(void) {
-    if (sVCamHookInstalled) return;
     sVCamHookAttempts++;
 
     if (!sCMCaptureHandle) {
@@ -252,8 +264,8 @@ static void VCamTryInstallCaptureHook(void) {
 
     Class baseClass = objc_getClass("BWNodeOutput");
     SEL selector = sel_registerName("emitSampleBuffer:");
-    Method method = baseClass ? class_getInstanceMethod(baseClass, selector) : NULL;
-    if (!baseClass || !method) {
+    Method baseMethod = baseClass ? class_getInstanceMethod(baseClass, selector) : NULL;
+    if (!baseClass || !baseMethod) {
         VCamSetRuntimeStatus(@"hookState", baseClass ? @"selector-not-found" : @"class-not-found");
         VCamSetRuntimeStatus(@"hookAttempts", @(sVCamHookAttempts));
         if (sVCamHookAttempts < 30) {
@@ -265,54 +277,83 @@ static void VCamTryInstallCaptureHook(void) {
         return;
     }
 
-    // Match the proven upstream implementation: hook BWNodeOutput itself.
-    // The previous subclass-wide scan installed the same replacement IMP on
-    // several implementations. When a subclass called super, our lookup used
-    // the runtime class again and could resolve the subclass IMP recursively.
-    // That made "installed" ambiguous and could prevent the original callback
-    // from ever reaching the actual camera graph.
     if (!sOriginalIMPs) sOriginalIMPs = [NSMutableDictionary dictionary];
     if (!sHookedClasses) sHookedClasses = [NSMutableSet set];
 
-    NSString *className = NSStringFromClass(baseClass);
-    if ([sHookedClasses containsObject:className]) {
-        sVCamHookInstalled = YES;
+    int classCount = objc_getClassList(NULL, 0);
+    Class *classes = classCount > 0 ? (Class *)calloc((size_t)classCount, sizeof(Class)) : NULL;
+    if (!classes) {
+        VCamSetRuntimeStatus(@"hookState", @"class-list-unavailable");
         return;
     }
+    classCount = objc_getClassList(classes, classCount);
+    NSUInteger installedThisPass = 0;
+    NSUInteger eligibleCount = 0;
 
-    IMP original = NULL;
-    MSHookMessageEx(baseClass, selector, (IMP)VCamEmitSampleBuffer, &original);
-    if (original) {
-        @synchronized (sOriginalIMPs) {
-            sOriginalIMPs[className] = [NSValue valueWithPointer:original];
-            [sHookedClasses addObject:className];
+    // Hook only leaf implementations. If an overridden method calls super,
+    // the superclass remains untouched and its original implementation runs
+    // normally. Hooking both parent and child with one replacement IMP causes
+    // the child original to re-enter the replacement through super.
+    for (int i = 0; i < classCount; i++) {
+        Class candidate = classes[i];
+        if (!candidate || candidate == baseClass) continue;
+
+        BOOL descendsFromBase = NO;
+        for (Class parent = class_getSuperclass(candidate); parent; parent = class_getSuperclass(parent)) {
+            if (parent == baseClass) { descendsFromBase = YES; break; }
         }
+        if (!descendsFromBase || !VCamClassImplementsSelectorDirectly(candidate, selector)) continue;
+        if (VCamHasOverridingDescendant(candidate, classes, classCount, selector)) continue;
+
+        NSString *className = NSStringFromClass(candidate);
+        @synchronized (sOriginalIMPs) {
+            if ([sHookedClasses containsObject:className]) continue;
+        }
+        eligibleCount++;
+
+        IMP original = NULL;
+        MSHookMessageEx(candidate, selector, (IMP)VCamEmitSampleBuffer, &original);
+        if (original) {
+            @synchronized (sOriginalIMPs) {
+                sOriginalIMPs[className] = [NSValue valueWithPointer:original];
+                [sHookedClasses addObject:className];
+            }
+            installedThisPass++;
+            NSLog(@"[VCam] hooked leaf camera node %@ original=%p", className, original);
+        }
+    }
+    free(classes);
+
+    NSUInteger totalHooked = 0;
+    @synchronized (sOriginalIMPs) { totalHooked = sHookedClasses.count; }
+    if (totalHooked > 0) {
         sVCamHookInstalled = YES;
-        VCamSetRuntimeStatus(@"hookState", @"installed-base-class");
-        VCamSetRuntimeStatus(@"hookedClassCount", @1);
-        VCamSetRuntimeStatus(@"hookInstallPassCount", @1);
+        VCamSetRuntimeStatus(@"hookState", @"installed-concrete-leaf-classes");
+        VCamSetRuntimeStatus(@"hookedClassCount", @(totalHooked));
+        VCamSetRuntimeStatus(@"hookInstallPassCount", @(sVCamHookAttempts));
         VCamSetRuntimeStatus(@"hookInstalledAt", [NSDate date]);
         VCamSetRuntimeStatus(@"hookAttempts", @(sVCamHookAttempts));
-        NSLog(@"[VCam] installed proven BWNodeOutput emitSampleBuffer: hook; original IMP=%p", original);
+        NSLog(@"[VCam] camera hook pass complete: %lu leaf implementation(s), %lu newly installed",
+              (unsigned long)totalHooked, (unsigned long)installedThisPass);
         return;
     }
 
-    VCamSetRuntimeStatus(@"hookState", @"install-failed-no-original-imp");
+    VCamSetRuntimeStatus(@"hookState", eligibleCount ? @"install-failed-no-original-imp" : @"waiting-for-concrete-camera-node");
+    VCamSetRuntimeStatus(@"hookedClassCount", @0);
     VCamSetRuntimeStatus(@"hookAttempts", @(sVCamHookAttempts));
     if (sVCamHookAttempts < 30) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
             dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ VCamTryInstallCaptureHook(); });
     } else {
-        VCamSetRuntimeStatus(@"hookState", @"failed");
+        VCamSetRuntimeStatus(@"hookState", @"no-concrete-camera-node-found");
     }
 }
-
 %ctor {
     @autoreleasepool {
         NSString *processName = NSProcessInfo.processInfo.processName.lowercaseString;
         if ([processName isEqualToString:@"mediaserverd"]) {
             VCamResetRuntimeStatus();
-            NSLog(@"[VCam] camera daemon tweak loaded; scanning BWNodeOutput implementations");
+            NSLog(@"[VCam] camera daemon tweak loaded; scanning concrete BWNodeOutput camera nodes");
             VCamTryInstallCaptureHook();
         } else if (![processName isEqualToString:@"springboard"]) {
             NSLog(@"[VCam] app-level camera injection loaded in %@", processName);
