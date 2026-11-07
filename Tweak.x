@@ -14,10 +14,15 @@
 %hook BWNodeOutput
 
 - (void)emitSampleBuffer:(CMSampleBufferRef)sampleBuffer {
-    // Avoid gating on BWNodeOutput's private mediaType selector: its return
-    // value is not a stable public contract across iOS builds. A video sample
-    // is identified by its image buffer; audio samples pass through untouched.
     if (!sampleBuffer) {
+        %orig(sampleBuffer);
+        return;
+    }
+
+    // Keep the upstream VCam video-type check. BWNodeOutput can also emit
+    // non-video samples; only camera video buffers are replacement targets.
+    unsigned int mediaType = ((unsigned int (*)(id, SEL))objc_msgSend)(self, sel_registerName("mediaType"));
+    if (mediaType != 'vide') {
         %orig(sampleBuffer);
         return;
     }
@@ -49,14 +54,20 @@
 
     @autoreleasepool {
         loadReplacementMedia();
-        // CIContext renders directly to CVPixelBuffer. Locking the base address
-        // is only needed for CPU byte access and can force costly synchronization
-        // on GPU-backed camera buffers, causing preview stutter.
-        @try {
-            drawReplacementOntoBuffer(imageBuffer);
-        } @catch (NSException *exception) {
-            VCamSetRuntimeStatus(@"renderError", exception.reason ?: @"Unknown render exception");
-            NSLog(@"[VCam] Failed to render replacement media: %@", exception);
+        // Match the upstream camera-buffer contract: lock the pixel buffer
+        // while replacing its contents, and always unlock before forwarding it.
+        CVReturn lockResult = CVPixelBufferLockBaseAddress(imageBuffer, 0);
+        if (lockResult == kCVReturnSuccess) {
+            @try {
+                drawReplacementOntoBuffer(imageBuffer);
+            } @catch (NSException *exception) {
+                VCamSetRuntimeStatus(@"renderError", exception.reason ?: @"Unknown render exception");
+                NSLog(@"[VCam] Failed to render replacement media: %@", exception);
+            } @finally {
+                CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
+            }
+        } else {
+            VCamSetRuntimeStatus(@"renderError", [NSString stringWithFormat:@"Camera pixel buffer lock failed: %d", lockResult]);
         }
     }
 
