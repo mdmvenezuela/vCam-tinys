@@ -13,7 +13,7 @@ NSString * const VCamOffsetYKey = @"OffsetY";
 NSString * const VCamRotationKey = @"Rotation";
 NSString * const VCamZoomKey = @"Zoom";
 NSString * const VCamVideoPausedKey = @"VideoPaused";
-NSString * const VCamRuntimeVersion = @"0.1.39";
+NSString * const VCamRuntimeVersion = @"0.1.40";
 
 static NSString *VCamPreferencesDirectory(void) {
     // Keep persistent preferences outside /tmp; only the selected media is temporary.
@@ -81,7 +81,10 @@ static NSString *VCamCurrentDaemonName(void) {
 }
 
 static NSString *VCamRuntimeStatusDirectory(void) {
-    return @"/tmp/VCamStatus";
+    // RootHide can expose a different /tmp view to SpringBoard and mediaserverd.
+    // Keep diagnostics beside selected media, whose shared readability has
+    // already been verified from mediaserverd.
+    return [VCamMediaDirectory() stringByAppendingPathComponent:@".runtime-status"];
 }
 
 static NSString *VCamRuntimeStatusFilePathForProcess(NSString *processName) {
