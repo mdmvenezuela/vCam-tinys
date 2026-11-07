@@ -14,13 +14,21 @@
 %hook BWNodeOutput
 
 - (void)emitSampleBuffer:(CMSampleBufferRef)sampleBuffer {
-    static uint64_t sVCamHookFrameCount = 0;
-    unsigned int mediaType = ((unsigned int (*)(id, SEL))objc_msgSend)(self, sel_registerName("mediaType"));
-    if (mediaType != 'vide') {
+    // Avoid gating on BWNodeOutput's private mediaType selector: its return
+    // value is not a stable public contract across iOS builds. A video sample
+    // is identified by its image buffer; audio samples pass through untouched.
+    if (!sampleBuffer) {
         %orig(sampleBuffer);
         return;
     }
 
+    CVPixelBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (!imageBuffer) {
+        %orig(sampleBuffer);
+        return;
+    }
+
+    static uint64_t sVCamHookFrameCount = 0;
     static dispatch_once_t sFirstVideoBuffer;
     dispatch_once(&sFirstVideoBuffer, ^{
         CVPixelBufferRef firstBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
@@ -37,12 +45,6 @@
     if (hookFrameCount == 1 || (hookFrameCount % 30) == 0) {
         VCamSetRuntimeStatus(@"cameraHookFrameCount", @(hookFrameCount));
         VCamSetRuntimeStatus(@"cameraHookLastFrameAt", [NSDate date]);
-    }
-
-    CVPixelBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-    if (!imageBuffer) {
-        %orig(sampleBuffer);
-        return;
     }
 
     @autoreleasepool {
