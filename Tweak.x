@@ -172,14 +172,16 @@ static void VCamTryInstallCaptureHook(void) {
         return;
     }
 
-    int classCount = objc_getClassList(NULL, 0);
-    Class *classes = classCount > 0 ? (Class *)calloc((size_t)classCount, sizeof(Class)) : NULL;
+    int allocatedClassCount = objc_getClassList(NULL, 0);
+    Class *classes = allocatedClassCount > 0
+        ? (Class *)calloc((size_t)allocatedClassCount, sizeof(Class)) : NULL;
     if (!classes) {
         VCamSetRuntimeStatus(@"hookState", @"class-list-unavailable");
         VCamScheduleNextHookScan();
         return;
     }
-    classCount = objc_getClassList(classes, classCount);
+    int discoveredClassCount = objc_getClassList(classes, allocatedClassCount);
+    int classCount = MIN(discoveredClassCount, allocatedClassCount);
 
     NSUInteger newlyInstalled = 0;
     // Hook the base class AND all loaded subclasses that directly override
