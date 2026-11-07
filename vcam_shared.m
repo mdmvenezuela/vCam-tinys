@@ -13,7 +13,7 @@ NSString * const VCamOffsetYKey = @"OffsetY";
 NSString * const VCamRotationKey = @"Rotation";
 NSString * const VCamZoomKey = @"Zoom";
 NSString * const VCamVideoPausedKey = @"VideoPaused";
-NSString * const VCamRuntimeVersion = @"0.1.38";
+NSString * const VCamRuntimeVersion = @"0.1.39";
 
 static NSString *VCamPreferencesDirectory(void) {
     // Keep persistent preferences outside /tmp; only the selected media is temporary.
@@ -22,6 +22,47 @@ static NSString *VCamPreferencesDirectory(void) {
 
 static NSString *VCamPreferencesFilePath(void) {
     return [VCamPreferencesDirectory() stringByAppendingPathComponent:@"settings.plist"];
+}
+
+// Enabled is mirrored to a small file beside the selected media. This is the
+// same filesystem location mediaserverd has already proven it can read.
+static NSString *VCamEnabledMarkerPath(void) {
+    return [VCamMediaDirectory() stringByAppendingPathComponent:@".replacement-enabled"];
+}
+
+static NSNumber *VCamReadEnabledMarker(void) {
+    NSString *contents = [NSString stringWithContentsOfFile:VCamEnabledMarkerPath()
+                                                    encoding:NSUTF8StringEncoding
+                                                       error:nil];
+    contents = [contents stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if ([contents isEqualToString:@"1"]) return @YES;
+    if ([contents isEqualToString:@"0"]) return @NO;
+    return nil;
+}
+
+static void VCamWriteEnabledMarker(id value) {
+    NSString *directory = VCamMediaDirectory();
+    NSError *error = nil;
+    BOOL created = [[NSFileManager defaultManager] createDirectoryAtPath:directory
+                                              withIntermediateDirectories:YES
+                                                               attributes:@{ NSFilePosixPermissions: @0755 }
+                                                                    error:&error];
+    if (!created) {
+        NSLog(@"[VCam] cannot prepare enabled marker directory %@: %@", directory, error);
+        return;
+    }
+    chmod(directory.fileSystemRepresentation, 0755);
+    NSString *path = VCamEnabledMarkerPath();
+    if (!value) {
+        [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+        return;
+    }
+    NSString *contents = [value respondsToSelector:@selector(boolValue)] && [value boolValue] ? @"1" : @"0";
+    if ([contents writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&error]) {
+        chmod(path.fileSystemRepresentation, 0644);
+    } else {
+        NSLog(@"[VCam] cannot publish enabled marker %@: %@", path, error);
+    }
 }
 
 // On iOS 17.6 the supported camera path for this tweak is mediaserverd.
@@ -233,16 +274,28 @@ static BOOL VCamEnsurePreferencesDirectory(void) {
 id VCamCopySetting(NSString *key) {
     if (key.length == 0) return nil;
 
+    // Prefer the shared marker for Enabled. It does not depend on notify tokens
+    // being observed identically inside SpringBoard and RootHide daemons.
+    if ([key isEqualToString:VCamEnabledKey]) {
+        NSNumber *markerValue = VCamReadEnabledMarker();
+        if (markerValue) return markerValue;
+    }
+
     NSString *publishedValue = nil;
     if (VCamReadPublishedStringSetting(key, &publishedValue)) {
-        return VCamDeserializeSettingValue(key, publishedValue);
+        id value = VCamDeserializeSettingValue(key, publishedValue);
+        if ([key isEqualToString:VCamEnabledKey] && value) VCamWriteEnabledMarker(value);
+        return value;
     }
 
     // Migration path for values written by earlier releases. The first process
     // that can still see the legacy plist republishes each value to Darwin notify.
     NSDictionary *settings = [NSDictionary dictionaryWithContentsOfFile:VCamPreferencesFilePath()];
     id value = settings[key];
-    if (value) VCamPublishStringSetting(key, VCamSerializeSettingValue(key, value));
+    if (value) {
+        VCamPublishStringSetting(key, VCamSerializeSettingValue(key, value));
+        if ([key isEqualToString:VCamEnabledKey]) VCamWriteEnabledMarker(value);
+    }
     return value;
 }
 
@@ -260,6 +313,9 @@ void VCamSetSetting(NSString *key, id value) {
             else NSLog(@"[VCam] failed to write shared settings %@", path);
         }
     }
+
+    // Mirror the critical ON/OFF switch to the shared media directory too.
+    if ([key isEqualToString:VCamEnabledKey]) VCamWriteEnabledMarker(value);
 
     // Publish settings independently of the media file path on disk.
     // SpringBoard and mediaserverd consume the same Darwin notify state.
