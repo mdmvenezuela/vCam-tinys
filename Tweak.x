@@ -147,8 +147,10 @@ static void VCamScheduleNextHookScan(void) {
     sVCamHookScanScheduled = YES;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
                    dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        sVCamHookScanScheduled = NO;
-        VCamTryInstallCaptureHook();
+        @autoreleasepool {
+            sVCamHookScanScheduled = NO;
+            VCamTryInstallCaptureHook();
+        }
     });
 }
 
