@@ -58,19 +58,13 @@ static void VCamEmitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuff
 
                 @autoreleasepool {
                     loadReplacementMedia();
-                    CVReturn lockResult = CVPixelBufferLockBaseAddress(imageBuffer, 0);
-                    if (lockResult == kCVReturnSuccess) {
-                        @try {
-                            drawReplacementOntoBuffer(imageBuffer);
-                        } @catch (NSException *exception) {
-                            VCamSetRuntimeStatus(@"renderError", exception.reason ?: @"Unknown render exception");
-                            NSLog(@"[VCam] Failed to render replacement media: %@", exception);
-                        } @finally {
-                            CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
-                        }
-                    } else {
-                        VCamSetRuntimeStatus(@"renderError",
-                            [NSString stringWithFormat:@"Camera pixel buffer lock failed: %d", lockResult]);
+                    // CIContext can write through the GPU/IOSurface path.
+                    // Do not CPU-lock a camera-owned buffer before CIContext renders into it.
+                    @try {
+                        drawReplacementOntoBuffer(imageBuffer);
+                    } @catch (NSException *exception) {
+                        VCamSetRuntimeStatus(@"renderError", exception.reason ?: @"Unknown render exception");
+                        NSLog(@"[VCam] Failed to render replacement media: %@", exception);
                     }
                 }
             }
@@ -157,17 +151,12 @@ static void VCamAppCaptureOutput(id self, SEL _cmd, AVCaptureOutput *output,
             }
             @autoreleasepool {
                 loadReplacementMedia();
-                CVReturn lockResult = CVPixelBufferLockBaseAddress(imageBuffer, 0);
-                if (lockResult == kCVReturnSuccess) {
-                    @try {
-                        drawReplacementOntoBuffer(imageBuffer);
-                    } @catch (NSException *exception) {
-                        NSLog(@"[VCam] app delegate render exception: %@", exception);
-                    } @finally {
-                        CVPixelBufferUnlockBaseAddress(imageBuffer, 0);
-                    }
-                } else if (count == 1) {
-                    NSLog(@"[VCam] app delegate pixel buffer lock failed: %d", lockResult);
+                // CIContext writes through the pixel buffer/IOSurface; a CPU
+                // base-address lock is not required for this GPU render path.
+                @try {
+                    drawReplacementOntoBuffer(imageBuffer);
+                } @catch (NSException *exception) {
+                    NSLog(@"[VCam] app delegate render exception: %@", exception);
                 }
             }
         }
