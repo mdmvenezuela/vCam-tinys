@@ -80,29 +80,6 @@ static void VCamEmitSampleBuffer(id self, SEL _cmd, CMSampleBufferRef sampleBuff
     }
 }
 
-static BOOL VCamClassIsBWNodeOutputSubclass(Class candidate, Class baseClass) {
-    for (Class current = candidate; current; current = class_getSuperclass(current)) {
-        if (current == baseClass) return YES;
-    }
-    return NO;
-}
-
-static BOOL VCamClassImplementsSelectorDirectly(Class cls, SEL selector) {
-    unsigned int count = 0;
-    Method *methods = class_copyMethodList(cls, &count);
-    BOOL found = NO;
-    for (unsigned int i = 0; i < count; i++) {
-        if (method_getName(methods[i]) == selector) {
-            found = YES;
-            break;
-        }
-    }
-    free(methods);
-    return found;
-}
-
-
-
 // -----------------------------------------------------------------------------
 // Per-app AVFoundation fallback, adapted from Five-great/ios-vcam.
 // Hook the actual delegate class registered with AVCaptureVideoDataOutput.
@@ -257,7 +234,8 @@ static void VCamTryInstallCaptureHook(void) {
 
     Class baseClass = objc_getClass("BWNodeOutput");
     SEL selector = sel_registerName("emitSampleBuffer:");
-    if (!baseClass || !class_getInstanceMethod(baseClass, selector)) {
+    Method method = baseClass ? class_getInstanceMethod(baseClass, selector) : NULL;
+    if (!baseClass || !method) {
         VCamSetRuntimeStatus(@"hookState", baseClass ? @"selector-not-found" : @"class-not-found");
         VCamSetRuntimeStatus(@"hookAttempts", @(sVCamHookAttempts));
         if (sVCamHookAttempts < 30) {
@@ -269,50 +247,45 @@ static void VCamTryInstallCaptureHook(void) {
         return;
     }
 
+    // Match the proven upstream implementation: hook BWNodeOutput itself.
+    // The previous subclass-wide scan installed the same replacement IMP on
+    // several implementations. When a subclass called super, our lookup used
+    // the runtime class again and could resolve the subclass IMP recursively.
+    // That made "installed" ambiguous and could prevent the original callback
+    // from ever reaching the actual camera graph.
     if (!sOriginalIMPs) sOriginalIMPs = [NSMutableDictionary dictionary];
     if (!sHookedClasses) sHookedClasses = [NSMutableSet set];
 
-    int classCount = objc_getClassList(NULL, 0);
-    if (classCount > 0) {
-        Class *classes = (Class *)calloc((size_t)classCount, sizeof(Class));
-        classCount = objc_getClassList(classes, classCount);
-        NSUInteger installedCount = 0;
-        for (int i = 0; i < classCount; i++) {
-            Class candidate = classes[i];
-            if (!candidate || !VCamClassIsBWNodeOutputSubclass(candidate, baseClass)) continue;
-            if (!VCamClassImplementsSelectorDirectly(candidate, selector)) continue;
-
-            NSString *className = NSStringFromClass(candidate);
-            if ([sHookedClasses containsObject:className]) continue;
-            Method method = class_getInstanceMethod(candidate, selector);
-            if (!method) continue;
-
-            IMP original = NULL;
-            MSHookMessageEx(candidate, selector, (IMP)VCamEmitSampleBuffer, &original);
-            if (original) {
-                sOriginalIMPs[className] = [NSValue valueWithPointer:original];
-                [sHookedClasses addObject:className];
-                installedCount++;
-                NSLog(@"[VCam] hooked %@ -[%@ emitSampleBuffer:]", className, className);
-            }
-        }
-        free(classes);
-        VCamSetRuntimeStatus(@"hookedClassCount", @(sHookedClasses.count));
-        VCamSetRuntimeStatus(@"hookInstallPassCount", @(installedCount));
+    NSString *className = NSStringFromClass(baseClass);
+    if ([sHookedClasses containsObject:className]) {
+        sVCamHookInstalled = YES;
+        return;
     }
 
-    sVCamHookInstalled = [sHookedClasses containsObject:@"BWNodeOutput"] || sHookedClasses.count > 0;
-    VCamSetRuntimeStatus(@"hookState", sVCamHookInstalled ? @"installed" : @"no-concrete-implementations");
-    VCamSetRuntimeStatus(@"hookInstalledAt", [NSDate date]);
-    VCamSetRuntimeStatus(@"hookAttempts", @(sVCamHookAttempts));
-    NSLog(@"[VCam] BWNodeOutput hook scan complete: %lu class(es) hooked",
-          (unsigned long)sHookedClasses.count);
+    IMP original = NULL;
+    MSHookMessageEx(baseClass, selector, (IMP)VCamEmitSampleBuffer, &original);
+    if (original) {
+        @synchronized (sOriginalIMPs) {
+            sOriginalIMPs[className] = [NSValue valueWithPointer:original];
+            [sHookedClasses addObject:className];
+        }
+        sVCamHookInstalled = YES;
+        VCamSetRuntimeStatus(@"hookState", @"installed-base-class");
+        VCamSetRuntimeStatus(@"hookedClassCount", @1);
+        VCamSetRuntimeStatus(@"hookInstallPassCount", @1);
+        VCamSetRuntimeStatus(@"hookInstalledAt", [NSDate date]);
+        VCamSetRuntimeStatus(@"hookAttempts", @(sVCamHookAttempts));
+        NSLog(@"[VCam] installed proven BWNodeOutput emitSampleBuffer: hook; original IMP=%p", original);
+        return;
+    }
 
-    // Re-scan periodically during daemon startup: camera node subclasses may
-    // only be registered after the private capture graph is initialized.
+    VCamSetRuntimeStatus(@"hookState", @"install-failed-no-original-imp");
+    VCamSetRuntimeStatus(@"hookAttempts", @(sVCamHookAttempts));
     if (sVCamHookAttempts < 30) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
             dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ VCamTryInstallCaptureHook(); });
+    } else {
+        VCamSetRuntimeStatus(@"hookState", @"failed");
     }
 }
 
